@@ -2,7 +2,7 @@
 /**
  * compress-worker.js — GitHub Actions HLS video compression worker
  *
- * Downloads video → FFmpeg encode to H.264 540p HLS (fmp4 segments) →
+ * Downloads video → FFmpeg encode to H.265 480p HLS (fmp4 segments) →
  * Uploads all HLS files to SpaceByte → Calls VPS callback.
  *
  * Sends real-time progress updates to VPS every second via PROGRESS_URL.
@@ -227,36 +227,40 @@ async function downloadParallel(totalBytes) {
 
 // ─── Step 2: FFmpeg encode to H.264 540p HLS ─────────
 async function encodeHLS() {
-  log("Encoding to H.264 540p HLS (fmp4 segments)...");
+  log("Encoding to H.265 480p HLS (fmp4 segments)...");
   fs.mkdirSync(HLS_DIR, { recursive: true });
 
   updateProgress({ phase: "converting", percent: 0, speed: null, eta: null, detail: "Probing input..." });
   await sendProgress(true);
 
-  // Probe input for duration
+  // Probe input for duration and resolution
   let duration = 0;
+  let inputHeight = 0;
   try {
     const probe = execSync(`ffprobe -v error -show_streams -show_format -of json "${INPUT_FILE}"`, { timeout: 30000 }).toString();
     const info = JSON.parse(probe);
     const video = info.streams?.find(s => s.codec_type === "video");
     duration = parseFloat(info.format?.duration || "0");
+    inputHeight = parseInt(video?.height || "0", 10);
     if (video) log(`Input: ${video.width}x${video.height} ${video.codec_name} duration=${Math.round(duration)}s`);
   } catch (_) { /* non-fatal */ }
+
+  // Choose output height: cap at 480p, keep original if already smaller
+  const targetHeight = Math.min(480, inputHeight || 480);
 
   const manifestPath = path.join(HLS_DIR, "index.m3u8");
   const args = [
     "-y", "-i", INPUT_FILE,
-    "-c:v", "libx264",
-    "-profile:v", "high",
-    "-level:v", "4.1",
-    "-crf", "26",
-    "-preset", "medium",
-    "-vf", "scale=-2:'min(540,ih)'",
+    "-c:v", "libx265",
+    "-crf", "28",
+    "-preset", "slow",
+    "-vf", `scale=-2:'min(${targetHeight},ih)'`,
     "-pix_fmt", "yuv420p",
+    "-tag:v", "hvc1",
     "-g", "120",
     "-keyint_min", "120",
     "-sc_threshold", "0",
-    "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+    "-c:a", "aac", "-b:a", "96k", "-ac", "2",
     "-f", "hls",
     "-hls_time", "10",
     "-hls_playlist_type", "vod",
@@ -371,78 +375,12 @@ async function getOrCreateCategoryFolder() {
   return String(id);
 }
 
-// ─── Step 3a: Upload HLS files to VPS disk (primary — instant playback) ──
-async function uploadToVPS(hlsFiles) {
-  const vpsBase = CALLBACK_URL.replace(/\/api\/compress\/callback$/, "");
-  const uploadUrl = `${vpsBase}/api/compress/upload-segment`;
-
-  log(`Uploading ${hlsFiles.length} HLS files to VPS (${vpsBase})...`);
-  updateProgress({ phase: "uploading", percent: 0, speed: null, eta: null, detail: "Uploading to VPS..." });
-  await sendProgress(true);
-
-  let uploaded = 0;
-  const total = hlsFiles.length;
-  let totalUploadedBytes = 0;
-  const totalUploadSize = hlsFiles.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
-  const uploadStartTime = Date.now();
-
-  async function uploadOne(fileName) {
-    const filePath = path.join(HLS_DIR, fileName);
-    const fileData = fs.readFileSync(filePath);
-
-    await axios.post(uploadUrl, fileData, {
-      headers: {
-        "Content-Type": "application/octet-stream",
-        "X-Secret": SECRET,
-        "X-Media-Id": MEDIA_ID,
-        "X-File-Name": fileName
-      },
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-      timeout: 120000
-    });
-
-    uploaded++;
-    totalUploadedBytes += fileData.length;
-    const pct = (uploaded / total) * 100;
-    const elapsedSec = (Date.now() - uploadStartTime) / 1000;
-    const speed = elapsedSec > 0 ? totalUploadedBytes / elapsedSec : 0;
-    const remaining = speed > 0 ? (totalUploadSize - totalUploadedBytes) / speed : null;
-
-    updateProgress({
-      phase: "uploading",
-      percent: Math.round(pct * 10) / 10,
-      speed: Math.round(speed),
-      eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
-      detail: `VPS: ${uploaded}/${total} (${(totalUploadedBytes / 1024 / 1024).toFixed(1)} MB)`
-    });
-  }
-
-  const queue = [...hlsFiles];
-  const active = new Set();
-  while (queue.length > 0 || active.size > 0) {
-    while (active.size < PARALLEL_UPLOADS && queue.length > 0) {
-      const fileName = queue.shift();
-      const p = uploadOne(fileName).catch(err => {
-        log(`  Retry VPS: ${fileName} (${err.message.slice(0, 80)})`);
-        return uploadOne(fileName);
-      });
-      active.add(p);
-      p.finally(() => active.delete(p));
-    }
-    if (active.size > 0) await Promise.race([...active]);
-  }
-
-  log(`VPS upload complete: ${total} files, ${(totalUploadSize / 1024 / 1024).toFixed(1)} MB`);
-  updateProgress({ phase: "uploading", percent: 100, speed: null, eta: 0, detail: `${total} files uploaded to VPS` });
-  await sendProgress(true);
-  return { totalSize: totalUploadSize, segmentCount: total };
-}
-
-// ─── Step 3b: Upload to SpaceByte via direct S3 presigned URLs (backup) ──
+// ─── Step 3: Upload to SpaceByte via direct S3 presigned URLs ──
 async function uploadToSpaceByte(hlsFiles) {
-  if (!SB_TOKEN) { log("SpaceByte token not set, skipping backup"); return null; }
-  log("Uploading HLS to SpaceByte (direct S3 backup)...");
+  if (!SB_TOKEN) throw new Error("SPACEBYTE_API_TOKEN is required");
+  log(`Uploading ${hlsFiles.length} HLS files to SpaceByte (direct S3)...`);
+  updateProgress({ phase: "uploading", percent: 0, speed: null, eta: null, detail: "Uploading to SpaceByte..." });
+  await sendProgress(true);
 
   const categoryFolderId = await getOrCreateCategoryFolder();
   const folderName = `hls_${FILE_NAME}_${Date.now()}`.slice(0, 200);
@@ -489,7 +427,12 @@ async function uploadToSpaceByte(hlsFiles) {
     const id = entry.data?.fileEntry?.id;
     if (id) fileMap[fileName] = String(id);
     uploaded++;
-    if (uploaded % 10 === 0) log(`  SpaceByte: ${uploaded}/${hlsFiles.length}`);
+    const pct = (uploaded / hlsFiles.length) * 100;
+    updateProgress({
+      phase: "uploading",
+      percent: Math.round(pct * 10) / 10,
+      detail: `SpaceByte: ${uploaded}/${hlsFiles.length}`
+    });
   }
 
   const queue = [...hlsFiles];
@@ -515,7 +458,7 @@ async function uploadToSpaceByte(hlsFiles) {
 }
 
 // ─── Step 4: Callback to VPS ─────────────────────────
-async function callback(vpsData, sbData, originalSize) {
+async function callback(sbData, originalSize) {
   log(`Calling back to VPS: ${CALLBACK_URL}`);
   updateProgress({ phase: "done", percent: 100, detail: "Sending results..." });
   await sendProgress(true);
@@ -524,12 +467,11 @@ async function callback(vpsData, sbData, originalSize) {
     mediaId: MEDIA_ID,
     jobId: JOB_ID,
     hls: {
-      vpsLocal: true,
-      segmentCount: vpsData.segmentCount,
-      totalSize: vpsData.totalSize,
-      folderId: sbData?.folderId || null,
-      manifestFileId: sbData?.manifestFileId || null,
-      fileMap: sbData?.fileMap || null
+      segmentCount: sbData.segmentCount,
+      totalSize: sbData.totalSize,
+      folderId: sbData.folderId,
+      manifestFileId: sbData.manifestFileId,
+      fileMap: sbData.fileMap
     },
     originalSize,
     secret: SECRET
@@ -548,6 +490,10 @@ async function main() {
     console.error("Missing required env vars (MEDIA_ID, CALLBACK_URL, SOURCE_URL)");
     process.exit(1);
   }
+  if (!SB_TOKEN) {
+    console.error("Missing SPACEBYTE_API_TOKEN");
+    process.exit(1);
+  }
 
   fs.mkdirSync(TEMP_DIR, { recursive: true });
   log(`=== HLS Compress: ${MEDIA_ID} (job ${JOB_ID}) ===`);
@@ -558,20 +504,10 @@ async function main() {
   const reduction = originalSize > 0 ? ((1 - totalSize / originalSize) * 100).toFixed(1) : 0;
   log(`Size reduction: ${reduction}% (${(originalSize / 1024 / 1024).toFixed(1)} MB → ${(totalSize / 1024 / 1024).toFixed(1)} MB)`);
 
-  // Upload to VPS (primary, instant playback) and SpaceByte (backup) in parallel
-  const [vpsResult, sbResult] = await Promise.allSettled([
-    uploadToVPS(files),
-    uploadToSpaceByte(files)
-  ]);
+  // Upload to SpaceByte via direct S3 presigned URLs
+  const sbData = await uploadToSpaceByte(files);
 
-  if (vpsResult.status === "rejected") {
-    throw new Error(`VPS upload failed: ${vpsResult.reason?.message || vpsResult.reason}`);
-  }
-
-  const sbData = sbResult.status === "fulfilled" ? sbResult.value : null;
-  if (!sbData) log("Warning: SpaceByte backup failed — VPS-only mode");
-
-  await callback(vpsResult.value, sbData, originalSize);
+  await callback(sbData, originalSize);
 
   try { fs.rmSync(HLS_DIR, { recursive: true, force: true }); } catch (_) {}
   log("=== Done! ===");
