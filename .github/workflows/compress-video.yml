@@ -24,6 +24,9 @@ on:
       category:
         description: "Content category: movie or series"
         required: true
+      language:
+        description: "Audio language to select (e.g. Hindi, English, Telugu)"
+        required: false
 
 jobs:
   compress:
@@ -65,4 +68,5 @@ jobs:
           CALLBACK_URL: ${{ inputs.callback_url }}
           PROGRESS_URL: ${{ inputs.progress_url }}
           CATEGORY: ${{ inputs.category }}
+          AUDIO_LANGUAGE: ${{ inputs.language }}
         run: node scripts/compress-worker.js
