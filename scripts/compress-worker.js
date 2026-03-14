@@ -43,7 +43,7 @@ const INPUT_FILE = path.join(TEMP_DIR, "input.mp4");
 const HLS_DIR = path.join(TEMP_DIR, "hls");
 
 const PARALLEL_UPLOADS = 30;
-const PARALLEL_DOWNLOAD_CHUNKS = 8;
+const PARALLEL_DOWNLOAD_CHUNKS = 4;
 const DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB per chunk
 const PROGRESS_INTERVAL = 1000; // 1 second
 
@@ -82,6 +82,24 @@ function updateProgress(updates) {
   sendProgress();
 }
 
+// ─── Retry helper for 429 rate limits ──────────────
+async function withRetry(fn, label = "", maxRetries = 5) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err.response?.status === 429 && attempt < maxRetries) {
+        const retryAfter = parseInt(err.response.headers["retry-after"] || "0", 10);
+        const wait = retryAfter > 0 ? retryAfter * 1000 : Math.min(3000 * Math.pow(2, attempt), 60000);
+        log(`  429 rate limit${label ? " (" + label + ")" : ""}, waiting ${(wait/1000).toFixed(0)}s (attempt ${attempt+1}/${maxRetries})`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // ─── Step 1: Download source video (parallel chunks) ─
 async function download() {
   log(`Downloading from: ${SOURCE_URL.slice(0, 80)}...`);
@@ -91,12 +109,11 @@ async function download() {
   let totalBytes = 0;
   let acceptsRanges = false;
   try {
-    const head = await axios.head(SOURCE_URL, { timeout: 30000, maxRedirects: 5 });
+    const head = await withRetry(() => axios.head(SOURCE_URL, { timeout: 30000, maxRedirects: 5 }), "HEAD");
     totalBytes = parseInt(head.headers["content-length"] || "0", 10);
     acceptsRanges = (head.headers["accept-ranges"] || "").toLowerCase() === "bytes";
   } catch (_) {
-    // HEAD failed — try GET to get content-length
-    const probe = await axios.get(SOURCE_URL, { responseType: "stream", timeout: 30000, maxRedirects: 5 });
+    const probe = await withRetry(() => axios.get(SOURCE_URL, { responseType: "stream", timeout: 30000, maxRedirects: 5 }), "probe");
     totalBytes = parseInt(probe.headers["content-length"] || "0", 10);
     acceptsRanges = (probe.headers["accept-ranges"] || "").toLowerCase() === "bytes";
     probe.data.destroy();
@@ -122,9 +139,9 @@ async function downloadSingle(totalBytes) {
   log("Downloading (single stream)...");
   updateProgress({ phase: "downloading", percent: 0, detail: "Downloading..." });
 
-  const resp = await axios.get(SOURCE_URL, {
+  const resp = await withRetry(() => axios.get(SOURCE_URL, {
     responseType: "stream", timeout: 600000, maxRedirects: 5
-  });
+  }), "download");
 
   if (!totalBytes) totalBytes = parseInt(resp.headers["content-length"] || "0", 10);
   let downloadedBytes = 0;
@@ -179,12 +196,12 @@ async function downloadParallel(totalBytes) {
   const downloadStart = Date.now();
 
   async function downloadChunk(chunk) {
-    const resp = await axios.get(SOURCE_URL, {
+    const resp = await withRetry(() => axios.get(SOURCE_URL, {
       responseType: "arraybuffer",
       timeout: 300000,
       maxRedirects: 5,
       headers: { Range: `bytes=${chunk.start}-${chunk.end}` }
-    });
+    }), `chunk ${chunk.index}`);
 
     // Write at exact offset
     const chunkFd = fs.openSync(INPUT_FILE, "r+");
