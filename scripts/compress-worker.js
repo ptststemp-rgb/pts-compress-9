@@ -304,7 +304,7 @@ async function encodeHLS() {
     ...audioMapArgs,
     "-c:v", "libx265",
     "-crf", "28",
-    "-preset", "slow",
+    "-preset", "medium",
     "-vf", `scale=-2:'min(${targetHeight},ih)'`,
     "-pix_fmt", "yuv420p",
     "-tag:v", "hvc1",
