@@ -1,0 +1,549 @@
+#!/usr/bin/env node
+/**
+ * compress-worker.js — GitHub Actions HLS video compression worker
+ *
+ * Downloads video → FFmpeg encode to H.264 540p HLS (fmp4 segments) →
+ * Uploads all HLS files to SpaceByte → Calls VPS callback.
+ *
+ * Sends real-time progress updates to VPS every second via PROGRESS_URL.
+ *
+ * Environment variables (set by GitHub Actions):
+ *   SPACEBYTE_API_TOKEN        - SpaceByte API auth token
+ *   SPACEBYTE_PARENT_FOLDER_ID - Parent folder (optional)
+ *   VPS_COMPRESS_SECRET        - Shared secret for callback auth
+ *   JOB_ID                     - Job queue ID
+ *   MEDIA_ID                   - Media ID in database
+ *   FILE_NAME                  - Base name for HLS folder
+ *   SOURCE_URL                 - Direct download URL for source video
+ *   CALLBACK_URL               - VPS callback endpoint (completion)
+ *   PROGRESS_URL               - VPS progress endpoint (real-time)
+ */
+
+const fs = require("fs");
+const path = require("path");
+const { execSync, spawn } = require("child_process");
+const axios = require("axios");
+
+// ─── Config ──────────────────────────────────────────
+const SB_TOKEN = process.env.SPACEBYTE_API_TOKEN;
+const SB_PARENT = process.env.SPACEBYTE_PARENT_FOLDER_ID || null;
+const SECRET = process.env.VPS_COMPRESS_SECRET;
+const JOB_ID = process.env.JOB_ID;
+const MEDIA_ID = process.env.MEDIA_ID;
+const FILE_NAME = (process.env.FILE_NAME || "output").replace(/\.mp4$/i, "");
+const SOURCE_URL = process.env.SOURCE_URL;
+const CALLBACK_URL = process.env.CALLBACK_URL;
+const PROGRESS_URL = process.env.PROGRESS_URL;
+const CATEGORY = (process.env.CATEGORY || "movie").toLowerCase();
+
+const SB_API = "https://spacebyte.in/api/v1";
+const TEMP_DIR = "/tmp/compress";
+const INPUT_FILE = path.join(TEMP_DIR, "input.mp4");
+const HLS_DIR = path.join(TEMP_DIR, "hls");
+
+const PARALLEL_UPLOADS = 15;
+const PARALLEL_DOWNLOAD_CHUNKS = 8;
+const DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB per chunk
+const PROGRESS_INTERVAL = 1000; // 1 second
+
+function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
+
+// ─── Progress Reporter ───────────────────────────────
+let lastProgressSent = 0;
+const progressState = {
+  phase: "starting",
+  percent: 0,
+  speed: null,
+  eta: null,
+  detail: ""
+};
+
+async function sendProgress(force = false) {
+  if (!PROGRESS_URL) return;
+  const now = Date.now();
+  if (!force && now - lastProgressSent < PROGRESS_INTERVAL) return;
+  lastProgressSent = now;
+
+  try {
+    await axios.post(PROGRESS_URL, {
+      secret: SECRET,
+      jobId: JOB_ID,
+      mediaId: MEDIA_ID,
+      progress: { ...progressState }
+    }, { timeout: 5000 });
+  } catch (_) {
+    // Non-fatal: don't let progress reporting failures kill the job
+  }
+}
+
+function updateProgress(updates) {
+  Object.assign(progressState, updates);
+  sendProgress();
+}
+
+// ─── Step 1: Download source video (parallel chunks) ─
+async function download() {
+  log(`Downloading from: ${SOURCE_URL.slice(0, 80)}...`);
+  updateProgress({ phase: "downloading", percent: 0, detail: "Checking source..." });
+
+  // HEAD request to get content-length and check Range support
+  let totalBytes = 0;
+  let acceptsRanges = false;
+  try {
+    const head = await axios.head(SOURCE_URL, { timeout: 30000, maxRedirects: 5 });
+    totalBytes = parseInt(head.headers["content-length"] || "0", 10);
+    acceptsRanges = (head.headers["accept-ranges"] || "").toLowerCase() === "bytes";
+  } catch (_) {
+    // HEAD failed — try GET to get content-length
+    const probe = await axios.get(SOURCE_URL, { responseType: "stream", timeout: 30000, maxRedirects: 5 });
+    totalBytes = parseInt(probe.headers["content-length"] || "0", 10);
+    acceptsRanges = (probe.headers["accept-ranges"] || "").toLowerCase() === "bytes";
+    probe.data.destroy();
+  }
+
+  log(`Source: ${(totalBytes / 1024 / 1024).toFixed(1)} MB, Range support: ${acceptsRanges}`);
+
+  // Use parallel chunked download if Range is supported and file is large enough
+  if (acceptsRanges && totalBytes > DOWNLOAD_CHUNK_SIZE * 2) {
+    await downloadParallel(totalBytes);
+  } else {
+    await downloadSingle(totalBytes);
+  }
+
+  const size = fs.statSync(INPUT_FILE).size;
+  log(`Downloaded: ${(size / 1024 / 1024).toFixed(1)} MB`);
+  updateProgress({ phase: "downloading", percent: 100, speed: null, eta: 0, detail: `${(size / 1024 / 1024).toFixed(1)} MB downloaded` });
+  await sendProgress(true);
+  return size;
+}
+
+async function downloadSingle(totalBytes) {
+  log("Downloading (single stream)...");
+  updateProgress({ phase: "downloading", percent: 0, detail: "Downloading..." });
+
+  const resp = await axios.get(SOURCE_URL, {
+    responseType: "stream", timeout: 600000, maxRedirects: 5
+  });
+
+  if (!totalBytes) totalBytes = parseInt(resp.headers["content-length"] || "0", 10);
+  let downloadedBytes = 0;
+  let lastSpeedCheck = Date.now();
+  let lastSpeedBytes = 0;
+  const writer = fs.createWriteStream(INPUT_FILE);
+
+  resp.data.on("data", (chunk) => {
+    downloadedBytes += chunk.length;
+    const now = Date.now();
+    const elapsed = (now - lastSpeedCheck) / 1000;
+    if (elapsed >= 1) {
+      const speed = (downloadedBytes - lastSpeedBytes) / elapsed;
+      const remaining = totalBytes > 0 ? (totalBytes - downloadedBytes) / speed : null;
+      const pct = totalBytes > 0 ? Math.min(99, (downloadedBytes / totalBytes) * 100) : 0;
+      updateProgress({
+        phase: "downloading", percent: Math.round(pct * 10) / 10,
+        speed: Math.round(speed),
+        eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
+        detail: `${(downloadedBytes / 1024 / 1024).toFixed(1)} / ${totalBytes > 0 ? (totalBytes / 1024 / 1024).toFixed(1) + " MB" : "?"}`
+      });
+      lastSpeedCheck = now; lastSpeedBytes = downloadedBytes;
+    }
+  });
+
+  resp.data.pipe(writer);
+  await new Promise((resolve, reject) => {
+    writer.on("finish", resolve);
+    writer.on("error", reject);
+    resp.data.on("error", reject);
+  });
+}
+
+async function downloadParallel(totalBytes) {
+  // Split into chunks
+  const chunks = [];
+  for (let start = 0; start < totalBytes; start += DOWNLOAD_CHUNK_SIZE) {
+    const end = Math.min(start + DOWNLOAD_CHUNK_SIZE - 1, totalBytes - 1);
+    chunks.push({ index: chunks.length, start, end });
+  }
+
+  log(`Parallel download: ${chunks.length} chunks × ${(DOWNLOAD_CHUNK_SIZE / 1024 / 1024).toFixed(0)} MB, ${PARALLEL_DOWNLOAD_CHUNKS} threads`);
+  updateProgress({ phase: "downloading", percent: 0, detail: `0/${chunks.length} chunks (${PARALLEL_DOWNLOAD_CHUNKS} threads)` });
+
+  // Pre-allocate the file
+  const fd = fs.openSync(INPUT_FILE, "w");
+  fs.ftruncateSync(fd, totalBytes);
+  fs.closeSync(fd);
+
+  let completedChunks = 0;
+  let downloadedBytes = 0;
+  const downloadStart = Date.now();
+
+  async function downloadChunk(chunk) {
+    const resp = await axios.get(SOURCE_URL, {
+      responseType: "arraybuffer",
+      timeout: 300000,
+      maxRedirects: 5,
+      headers: { Range: `bytes=${chunk.start}-${chunk.end}` }
+    });
+
+    // Write at exact offset
+    const chunkFd = fs.openSync(INPUT_FILE, "r+");
+    fs.writeSync(chunkFd, Buffer.from(resp.data), 0, resp.data.byteLength, chunk.start);
+    fs.closeSync(chunkFd);
+
+    completedChunks++;
+    downloadedBytes += resp.data.byteLength;
+
+    const elapsedSec = (Date.now() - downloadStart) / 1000;
+    const speed = elapsedSec > 0 ? downloadedBytes / elapsedSec : 0;
+    const remaining = speed > 0 ? (totalBytes - downloadedBytes) / speed : null;
+    const pct = Math.min(99, (downloadedBytes / totalBytes) * 100);
+
+    updateProgress({
+      phase: "downloading",
+      percent: Math.round(pct * 10) / 10,
+      speed: Math.round(speed),
+      eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
+      detail: `${completedChunks}/${chunks.length} chunks (${(downloadedBytes / 1024 / 1024).toFixed(1)} MB)`
+    });
+  }
+
+  // Parallel execution with concurrency limit
+  const queue = [...chunks];
+  const active = new Set();
+
+  while (queue.length > 0 || active.size > 0) {
+    while (active.size < PARALLEL_DOWNLOAD_CHUNKS && queue.length > 0) {
+      const chunk = queue.shift();
+      const p = downloadChunk(chunk).catch(err => {
+        log(`  Retry chunk ${chunk.index} (${err.message.slice(0, 60)})`);
+        return downloadChunk(chunk);
+      });
+      active.add(p);
+      p.finally(() => active.delete(p));
+    }
+    if (active.size > 0) await Promise.race([...active]);
+  }
+}
+
+// ─── Step 2: FFmpeg encode to H.264 540p HLS ─────────
+async function encodeHLS() {
+  log("Encoding to H.264 540p HLS (fmp4 segments)...");
+  fs.mkdirSync(HLS_DIR, { recursive: true });
+
+  updateProgress({ phase: "converting", percent: 0, speed: null, eta: null, detail: "Probing input..." });
+  await sendProgress(true);
+
+  // Probe input for duration
+  let duration = 0;
+  try {
+    const probe = execSync(`ffprobe -v error -show_streams -show_format -of json "${INPUT_FILE}"`, { timeout: 30000 }).toString();
+    const info = JSON.parse(probe);
+    const video = info.streams?.find(s => s.codec_type === "video");
+    duration = parseFloat(info.format?.duration || "0");
+    if (video) log(`Input: ${video.width}x${video.height} ${video.codec_name} duration=${Math.round(duration)}s`);
+  } catch (_) { /* non-fatal */ }
+
+  const manifestPath = path.join(HLS_DIR, "index.m3u8");
+  const args = [
+    "-y", "-i", INPUT_FILE,
+    "-c:v", "libx264",
+    "-profile:v", "high",
+    "-level:v", "4.1",
+    "-crf", "26",
+    "-preset", "medium",
+    "-vf", "scale=-2:'min(540,ih)'",
+    "-pix_fmt", "yuv420p",
+    "-g", "120",
+    "-keyint_min", "120",
+    "-sc_threshold", "0",
+    "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+    "-f", "hls",
+    "-hls_time", "10",
+    "-hls_playlist_type", "vod",
+    "-hls_flags", "independent_segments",
+    "-hls_segment_type", "fmp4",
+    "-hls_fmp4_init_filename", "init.mp4",
+    "-hls_segment_filename", path.join(HLS_DIR, "seg_%05d.m4s"),
+    "-sn", "-dn",
+    "-progress", "pipe:1",
+    manifestPath
+  ];
+
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    let currentTimeSec = 0;
+
+    // Parse -progress pipe:1 output (key=value lines)
+    child.stdout.on("data", (chunk) => {
+      const lines = chunk.toString().split("\n");
+      for (const line of lines) {
+        if (line.startsWith("out_time_us=")) {
+          const us = parseInt(line.split("=")[1], 10);
+          if (Number.isFinite(us) && us > 0) {
+            currentTimeSec = us / 1000000;
+            const pct = duration > 0 ? Math.min(99, (currentTimeSec / duration) * 100) : 0;
+            const eta = duration > 0 && currentTimeSec > 0
+              ? Math.round((duration - currentTimeSec) * (Date.now() - encodeStartTime) / (currentTimeSec * 1000))
+              : null;
+
+            updateProgress({
+              phase: "converting",
+              percent: Math.round(pct * 10) / 10,
+              eta,
+              detail: `${Math.round(currentTimeSec)}s / ${Math.round(duration)}s encoded`
+            });
+          }
+        } else if (line.startsWith("speed=")) {
+          const speedStr = line.split("=")[1]?.trim();
+          if (speedStr && speedStr !== "N/A") {
+            updateProgress({ detail: `${Math.round(currentTimeSec)}s / ${Math.round(duration)}s (${speedStr})` });
+          }
+        }
+      }
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+      if (stderr.length > 8000) stderr = stderr.slice(-8000);
+    });
+
+    const encodeStartTime = Date.now();
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        try { fs.unlinkSync(INPUT_FILE); } catch (_) {}
+        const files = fs.readdirSync(HLS_DIR);
+        const totalSize = files.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
+        log(`HLS output: ${files.length} files, ${(totalSize / 1024 / 1024).toFixed(1)} MB total`);
+        updateProgress({ phase: "converting", percent: 100, eta: 0, detail: `${files.length} segments created` });
+        sendProgress(true);
+        resolve({ files, totalSize, duration });
+      } else {
+        reject(new Error(`FFmpeg failed (code ${code}): ${stderr.slice(-300)}`));
+      }
+    });
+    child.on("error", reject);
+  });
+}
+
+// ─── SpaceByte folder helpers ────────────────────────
+const sbHeaders = () => ({
+  Authorization: `Bearer ${SB_TOKEN}`,
+  "Content-Type": "application/json"
+});
+
+async function getOrCreateCategoryFolder() {
+  // Category folder name: "Movies" or "Series"
+  const categoryName = CATEGORY === "series" ? "Series" : "Movies";
+  const parentId = SB_PARENT || null;
+
+  // Search for existing folder (at root or under parent)
+  try {
+    const params = { per_page: 100 };
+    if (parentId) params.parentIds = parentId;
+    const resp = await axios.get(`${SB_API}/drive/file-entries`, {
+      headers: sbHeaders(), params, timeout: 15000
+    });
+    const entries = resp.data?.data || [];
+    const existing = entries.find(f =>
+      f.type === "folder" && (f.name || "").toLowerCase() === categoryName.toLowerCase()
+    );
+    if (existing) {
+      log(`Found existing "${categoryName}" folder: ${existing.id}`);
+      return String(existing.id);
+    }
+  } catch (err) {
+    log(`Could not list existing folders: ${err.message} — will try creating`);
+  }
+
+  // Create the category folder
+  const body = { name: categoryName };
+  if (parentId) body.parentId = String(parentId);
+  log(`Creating "${categoryName}" folder${parentId ? ` under parent ${parentId}` : " at root"}`);
+
+  const resp = await axios.post(`${SB_API}/folders`, body, {
+    headers: sbHeaders(), timeout: 15000
+  });
+
+  const id = resp.data?.folder?.id || resp.data?.id || resp.data?.data?.id;
+  if (!id) throw new Error(`Failed to create ${categoryName} folder: ${JSON.stringify(resp.data).slice(0, 300)}`);
+  return String(id);
+}
+
+// ─── Step 3: Upload HLS files to SpaceByte ───────────
+async function uploadHLS(hlsFiles) {
+  const folderName = `hls_${FILE_NAME}_${Date.now()}`.slice(0, 200);
+  log(`Creating SpaceByte folder: ${folderName}`);
+
+  updateProgress({ phase: "uploading", percent: 0, speed: null, eta: null, detail: "Creating folder..." });
+  await sendProgress(true);
+
+  // Get or create the category folder (Movies / Series)
+  const categoryFolderId = await getOrCreateCategoryFolder();
+  log(`Using category folder ID: ${categoryFolderId}`);
+
+  const folderResp = await axios.post(`${SB_API}/folders`, {
+    name: folderName,
+    parentId: categoryFolderId
+  }, {
+    headers: { Authorization: `Bearer ${SB_TOKEN}`, "Content-Type": "application/json" },
+    timeout: 15000
+  });
+
+  const folderId = folderResp.data?.folder?.id || folderResp.data?.id || folderResp.data?.data?.id;
+  if (!folderId) throw new Error(`Folder creation failed: ${JSON.stringify(folderResp.data).slice(0, 300)}`);
+  log(`Folder created: ID ${folderId}`);
+
+  const fileMap = {};
+  let uploaded = 0;
+  const total = hlsFiles.length;
+  let totalUploadedBytes = 0;
+  const totalUploadSize = hlsFiles.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
+  const uploadStartTime = Date.now();
+
+  async function uploadOne(fileName) {
+    const filePath = path.join(HLS_DIR, fileName);
+    const fileSize = fs.statSync(filePath).size;
+    const isManifest = fileName.endsWith(".m3u8");
+    const contentType = isManifest ? "application/vnd.apple.mpegurl"
+      : fileName.endsWith(".mp4") ? "video/mp4"
+      : "video/iso.segment";
+
+    // Use native http for streaming upload to avoid buffering
+    const FormData = require("form-data");
+    const form = new FormData();
+    form.append("file", fs.createReadStream(filePath), {
+      filename: fileName,
+      contentType,
+      knownLength: fileSize
+    });
+    form.append("parentId", String(folderId));
+
+    const resp = await axios.post(`${SB_API}/uploads`, form, {
+      headers: { ...form.getHeaders(), Authorization: `Bearer ${SB_TOKEN}` },
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity,
+      timeout: 300000
+    });
+
+    const id = resp.data?.fileEntry?.id || resp.data?.id || resp.data?.data?.id;
+    if (!id) throw new Error(`Upload ${fileName} failed: no ID returned`);
+    fileMap[fileName] = String(id);
+    uploaded++;
+    totalUploadedBytes += fileSize;
+
+    const pct = (uploaded / total) * 100;
+    const elapsedSec = (Date.now() - uploadStartTime) / 1000;
+    const speed = elapsedSec > 0 ? totalUploadedBytes / elapsedSec : 0;
+    const remaining = speed > 0 ? (totalUploadSize - totalUploadedBytes) / speed : null;
+
+    updateProgress({
+      phase: "uploading",
+      percent: Math.round(pct * 10) / 10,
+      speed: Math.round(speed),
+      eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
+      detail: `${uploaded}/${total} files (${(totalUploadedBytes / 1024 / 1024).toFixed(1)} MB)`
+    });
+  }
+
+  // Parallel upload
+  const queue = [...hlsFiles];
+  const active = new Set();
+
+  while (queue.length > 0 || active.size > 0) {
+    while (active.size < PARALLEL_UPLOADS && queue.length > 0) {
+      const fileName = queue.shift();
+      const p = uploadOne(fileName).catch(err => {
+        log(`  Retry: ${fileName} (${err.message.slice(0, 80)})`);
+        return uploadOne(fileName);
+      });
+      p._fileName = fileName;
+      active.add(p);
+      p.finally(() => active.delete(p));
+    }
+    if (active.size > 0) {
+      await Promise.race([...active]);
+    }
+  }
+
+  const manifestFileId = fileMap["index.m3u8"];
+  if (!manifestFileId) throw new Error("Manifest file (index.m3u8) was not uploaded");
+
+  log(`All ${total} HLS files uploaded. Manifest ID: ${manifestFileId}, Folder ID: ${folderId}`);
+  updateProgress({ phase: "uploading", percent: 100, speed: null, eta: 0, detail: `${total} files uploaded` });
+  await sendProgress(true);
+
+  return { folderId: String(folderId), manifestFileId, fileMap, totalSize: totalUploadSize, segmentCount: total };
+}
+
+// ─── Step 4: Callback to VPS ─────────────────────────
+async function callback(hlsData, originalSize) {
+  log(`Calling back to VPS: ${CALLBACK_URL}`);
+  updateProgress({ phase: "done", percent: 100, detail: "Sending results..." });
+  await sendProgress(true);
+
+  const resp = await axios.post(CALLBACK_URL, {
+    mediaId: MEDIA_ID,
+    jobId: JOB_ID,
+    hls: {
+      folderId: hlsData.folderId,
+      manifestFileId: hlsData.manifestFileId,
+      segmentCount: hlsData.segmentCount,
+      totalSize: hlsData.totalSize,
+      fileMap: hlsData.fileMap
+    },
+    originalSize,
+    secret: SECRET
+  }, {
+    timeout: 30000,
+    headers: { "Content-Type": "application/json" }
+  });
+
+  if (resp.data?.ok) log("VPS confirmed HLS update");
+  else log(`VPS response: ${JSON.stringify(resp.data).slice(0, 300)}`);
+}
+
+// ─── Main ────────────────────────────────────────────
+async function main() {
+  if (!SB_TOKEN || !MEDIA_ID || !CALLBACK_URL || !SOURCE_URL) {
+    console.error("Missing required env vars (SPACEBYTE_API_TOKEN, MEDIA_ID, CALLBACK_URL, SOURCE_URL)");
+    process.exit(1);
+  }
+
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+  log(`=== HLS Compress: ${MEDIA_ID} (job ${JOB_ID}) ===`);
+
+  const originalSize = await download();
+  const { files, totalSize } = await encodeHLS();
+
+  const reduction = originalSize > 0 ? ((1 - totalSize / originalSize) * 100).toFixed(1) : 0;
+  log(`Size reduction: ${reduction}% (${(originalSize / 1024 / 1024).toFixed(1)} MB → ${(totalSize / 1024 / 1024).toFixed(1)} MB)`);
+
+  const hlsData = await uploadHLS(files);
+  await callback(hlsData, originalSize);
+
+  try { fs.rmSync(HLS_DIR, { recursive: true, force: true }); } catch (_) {}
+  log("=== Done! ===");
+}
+
+main().catch(err => {
+  console.error(`\nFatal: ${err.message}`);
+
+  // Report failure
+  const failProgress = async () => {
+    if (PROGRESS_URL && SECRET) {
+      await axios.post(PROGRESS_URL, {
+        secret: SECRET, jobId: JOB_ID, mediaId: MEDIA_ID,
+        progress: { phase: "failed", percent: 0, detail: err.message.slice(0, 200) }
+      }, { timeout: 5000 }).catch(() => {});
+    }
+    if (CALLBACK_URL && SECRET) {
+      await axios.post(CALLBACK_URL, {
+        mediaId: MEDIA_ID, jobId: JOB_ID,
+        error: err.message, secret: SECRET
+      }, { timeout: 10000 }).catch(() => {});
+    }
+  };
+  failProgress().finally(() => process.exit(1));
+});
