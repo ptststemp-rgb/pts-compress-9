@@ -1,0 +1,67 @@
+name: HLS Compress Video 540p
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Job queue ID"
+        required: true
+      media_id:
+        description: "Media ID in database"
+        required: true
+      file_name:
+        description: "Base name for HLS folder"
+        required: true
+      source_url:
+        description: "Direct download URL for source video"
+        required: true
+      callback_url:
+        description: "VPS callback URL for completion"
+        required: true
+      progress_url:
+        description: "VPS progress URL for real-time updates"
+        required: true
+      category:
+        description: "Content category: movie or series"
+        required: true
+
+jobs:
+  compress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            scripts/compress-worker.js
+          sparse-checkout-cone-mode: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          npm install axios form-data
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Verify FFmpeg
+        run: |
+          which ffmpeg
+          ffmpeg -version | head -1
+
+      - name: Run HLS compression + upload
+        env:
+          SPACEBYTE_API_TOKEN: ${{ secrets.SPACEBYTE_API_TOKEN }}
+          SPACEBYTE_PARENT_FOLDER_ID: ${{ secrets.SPACEBYTE_PARENT_FOLDER_ID }}
+          VPS_COMPRESS_SECRET: ${{ secrets.VPS_COMPRESS_SECRET }}
+          JOB_ID: ${{ inputs.job_id }}
+          MEDIA_ID: ${{ inputs.media_id }}
+          FILE_NAME: ${{ inputs.file_name }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          PROGRESS_URL: ${{ inputs.progress_url }}
+          CATEGORY: ${{ inputs.category }}
+        run: node scripts/compress-worker.js
