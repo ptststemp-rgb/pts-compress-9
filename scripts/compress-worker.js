@@ -371,31 +371,15 @@ async function getOrCreateCategoryFolder() {
   return String(id);
 }
 
-// ─── Step 3: Upload HLS files to SpaceByte ───────────
-async function uploadHLS(hlsFiles) {
-  const folderName = `hls_${FILE_NAME}_${Date.now()}`.slice(0, 200);
-  log(`Creating SpaceByte folder: ${folderName}`);
+// ─── Step 3a: Upload HLS files to VPS disk (primary — instant playback) ──
+async function uploadToVPS(hlsFiles) {
+  const vpsBase = CALLBACK_URL.replace(/\/api\/compress\/callback$/, "");
+  const uploadUrl = `${vpsBase}/api/compress/upload-segment`;
 
-  updateProgress({ phase: "uploading", percent: 0, speed: null, eta: null, detail: "Creating folder..." });
+  log(`Uploading ${hlsFiles.length} HLS files to VPS (${vpsBase})...`);
+  updateProgress({ phase: "uploading", percent: 0, speed: null, eta: null, detail: "Uploading to VPS..." });
   await sendProgress(true);
 
-  // Get or create the category folder (Movies / Series)
-  const categoryFolderId = await getOrCreateCategoryFolder();
-  log(`Using category folder ID: ${categoryFolderId}`);
-
-  const folderResp = await axios.post(`${SB_API}/folders`, {
-    name: folderName,
-    parentId: categoryFolderId
-  }, {
-    headers: { Authorization: `Bearer ${SB_TOKEN}`, "Content-Type": "application/json" },
-    timeout: 15000
-  });
-
-  const folderId = folderResp.data?.folder?.id || folderResp.data?.id || folderResp.data?.data?.id;
-  if (!folderId) throw new Error(`Folder creation failed: ${JSON.stringify(folderResp.data).slice(0, 300)}`);
-  log(`Folder created: ID ${folderId}`);
-
-  const fileMap = {};
   let uploaded = 0;
   const total = hlsFiles.length;
   let totalUploadedBytes = 0;
@@ -404,35 +388,22 @@ async function uploadHLS(hlsFiles) {
 
   async function uploadOne(fileName) {
     const filePath = path.join(HLS_DIR, fileName);
-    const fileSize = fs.statSync(filePath).size;
-    const isManifest = fileName.endsWith(".m3u8");
-    const contentType = isManifest ? "application/vnd.apple.mpegurl"
-      : fileName.endsWith(".mp4") ? "video/mp4"
-      : "video/iso.segment";
+    const fileData = fs.readFileSync(filePath);
 
-    // Use native http for streaming upload to avoid buffering
-    const FormData = require("form-data");
-    const form = new FormData();
-    form.append("file", fs.createReadStream(filePath), {
-      filename: fileName,
-      contentType,
-      knownLength: fileSize
-    });
-    form.append("parentId", String(folderId));
-
-    const resp = await axios.post(`${SB_API}/uploads`, form, {
-      headers: { ...form.getHeaders(), Authorization: `Bearer ${SB_TOKEN}` },
+    await axios.post(uploadUrl, fileData, {
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Secret": SECRET,
+        "X-Media-Id": MEDIA_ID,
+        "X-File-Name": fileName
+      },
       maxContentLength: Infinity,
       maxBodyLength: Infinity,
-      timeout: 300000
+      timeout: 120000
     });
 
-    const id = resp.data?.fileEntry?.id || resp.data?.id || resp.data?.data?.id;
-    if (!id) throw new Error(`Upload ${fileName} failed: no ID returned`);
-    fileMap[fileName] = String(id);
     uploaded++;
-    totalUploadedBytes += fileSize;
-
+    totalUploadedBytes += fileData.length;
     const pct = (uploaded / total) * 100;
     const elapsedSec = (Date.now() - uploadStartTime) / 1000;
     const speed = elapsedSec > 0 ? totalUploadedBytes / elapsedSec : 0;
@@ -443,42 +414,108 @@ async function uploadHLS(hlsFiles) {
       percent: Math.round(pct * 10) / 10,
       speed: Math.round(speed),
       eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
-      detail: `${uploaded}/${total} files (${(totalUploadedBytes / 1024 / 1024).toFixed(1)} MB)`
+      detail: `VPS: ${uploaded}/${total} (${(totalUploadedBytes / 1024 / 1024).toFixed(1)} MB)`
     });
   }
 
-  // Parallel upload
   const queue = [...hlsFiles];
   const active = new Set();
-
   while (queue.length > 0 || active.size > 0) {
     while (active.size < PARALLEL_UPLOADS && queue.length > 0) {
       const fileName = queue.shift();
       const p = uploadOne(fileName).catch(err => {
-        log(`  Retry: ${fileName} (${err.message.slice(0, 80)})`);
+        log(`  Retry VPS: ${fileName} (${err.message.slice(0, 80)})`);
         return uploadOne(fileName);
       });
-      p._fileName = fileName;
       active.add(p);
       p.finally(() => active.delete(p));
     }
-    if (active.size > 0) {
-      await Promise.race([...active]);
-    }
+    if (active.size > 0) await Promise.race([...active]);
   }
 
-  const manifestFileId = fileMap["index.m3u8"];
-  if (!manifestFileId) throw new Error("Manifest file (index.m3u8) was not uploaded");
-
-  log(`All ${total} HLS files uploaded. Manifest ID: ${manifestFileId}, Folder ID: ${folderId}`);
-  updateProgress({ phase: "uploading", percent: 100, speed: null, eta: 0, detail: `${total} files uploaded` });
+  log(`VPS upload complete: ${total} files, ${(totalUploadSize / 1024 / 1024).toFixed(1)} MB`);
+  updateProgress({ phase: "uploading", percent: 100, speed: null, eta: 0, detail: `${total} files uploaded to VPS` });
   await sendProgress(true);
+  return { totalSize: totalUploadSize, segmentCount: total };
+}
 
-  return { folderId: String(folderId), manifestFileId, fileMap, totalSize: totalUploadSize, segmentCount: total };
+// ─── Step 3b: Upload to SpaceByte via direct S3 presigned URLs (backup) ──
+async function uploadToSpaceByte(hlsFiles) {
+  if (!SB_TOKEN) { log("SpaceByte token not set, skipping backup"); return null; }
+  log("Uploading HLS to SpaceByte (direct S3 backup)...");
+
+  const categoryFolderId = await getOrCreateCategoryFolder();
+  const folderName = `hls_${FILE_NAME}_${Date.now()}`.slice(0, 200);
+
+  const folderResp = await axios.post(`${SB_API}/folders`, {
+    name: folderName, parentId: categoryFolderId
+  }, { headers: sbHeaders(), timeout: 15000 });
+
+  const folderId = folderResp.data?.folder?.id || folderResp.data?.id || folderResp.data?.data?.id;
+  if (!folderId) throw new Error(`SpaceByte folder creation failed`);
+  log(`SpaceByte folder: ${folderId}`);
+
+  const fileMap = {};
+  let uploaded = 0;
+  const SB_PARALLEL = 5;
+
+  async function uploadOne(fileName) {
+    const filePath = path.join(HLS_DIR, fileName);
+    const fileData = fs.readFileSync(filePath);
+    const isManifest = fileName.endsWith(".m3u8");
+    const contentType = isManifest ? "application/vnd.apple.mpegurl"
+      : fileName.endsWith(".mp4") ? "video/mp4" : "video/iso.segment";
+    const ext = fileName.split(".").pop();
+
+    // Get presigned S3 URL
+    const presign = await axios.post(`${SB_API}/s3/simple/presign`, {
+      filename: fileName, mime: contentType, size: fileData.length, extension: ext
+    }, { headers: sbHeaders(), timeout: 20000 });
+
+    const { url, key, acl } = presign.data;
+
+    // Upload directly to S3
+    await axios.put(url, fileData, {
+      headers: { "Content-Type": contentType, "x-amz-acl": acl },
+      maxContentLength: Infinity, maxBodyLength: Infinity, timeout: 120000
+    });
+
+    // Register file entry in SpaceByte
+    const entry = await axios.post(`${SB_API}/s3/entries`, {
+      filename: key, parentId: String(folderId), size: fileData.length,
+      mime: contentType, clientMime: contentType, clientName: fileName, clientExtension: ext
+    }, { headers: sbHeaders(), timeout: 20000 });
+
+    const id = entry.data?.fileEntry?.id;
+    if (id) fileMap[fileName] = String(id);
+    uploaded++;
+    if (uploaded % 10 === 0) log(`  SpaceByte: ${uploaded}/${hlsFiles.length}`);
+  }
+
+  const queue = [...hlsFiles];
+  const active = new Set();
+  while (queue.length > 0 || active.size > 0) {
+    while (active.size < SB_PARALLEL && queue.length > 0) {
+      const fileName = queue.shift();
+      const p = uploadOne(fileName).catch(err => {
+        log(`  Retry SB: ${fileName} (${err.message.slice(0, 80)})`);
+        return uploadOne(fileName).catch(err2 => {
+          log(`  SB skip: ${fileName} (${err2.message.slice(0, 60)})`);
+        });
+      });
+      active.add(p);
+      p.finally(() => active.delete(p));
+    }
+    if (active.size > 0) await Promise.race([...active]);
+  }
+
+  const totalSize = hlsFiles.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
+  log(`SpaceByte backup: ${Object.keys(fileMap).length}/${hlsFiles.length} files, folder ${folderId}`);
+  return { folderId: String(folderId), manifestFileId: fileMap["index.m3u8"] || null, fileMap, totalSize, segmentCount: hlsFiles.length };
 }
 
 // ─── Step 4: Callback to VPS ─────────────────────────
-async function callback(hlsData, originalSize) {
+async function callback(vpsData, sbData, originalSize) {
   log(`Calling back to VPS: ${CALLBACK_URL}`);
   updateProgress({ phase: "done", percent: 100, detail: "Sending results..." });
   await sendProgress(true);
@@ -487,11 +524,12 @@ async function callback(hlsData, originalSize) {
     mediaId: MEDIA_ID,
     jobId: JOB_ID,
     hls: {
-      folderId: hlsData.folderId,
-      manifestFileId: hlsData.manifestFileId,
-      segmentCount: hlsData.segmentCount,
-      totalSize: hlsData.totalSize,
-      fileMap: hlsData.fileMap
+      vpsLocal: true,
+      segmentCount: vpsData.segmentCount,
+      totalSize: vpsData.totalSize,
+      folderId: sbData?.folderId || null,
+      manifestFileId: sbData?.manifestFileId || null,
+      fileMap: sbData?.fileMap || null
     },
     originalSize,
     secret: SECRET
@@ -500,14 +538,14 @@ async function callback(hlsData, originalSize) {
     headers: { "Content-Type": "application/json" }
   });
 
-  if (resp.data?.ok) log("VPS confirmed HLS update");
+  if (resp.data?.ok) log("VPS confirmed");
   else log(`VPS response: ${JSON.stringify(resp.data).slice(0, 300)}`);
 }
 
 // ─── Main ────────────────────────────────────────────
 async function main() {
-  if (!SB_TOKEN || !MEDIA_ID || !CALLBACK_URL || !SOURCE_URL) {
-    console.error("Missing required env vars (SPACEBYTE_API_TOKEN, MEDIA_ID, CALLBACK_URL, SOURCE_URL)");
+  if (!MEDIA_ID || !CALLBACK_URL || !SOURCE_URL) {
+    console.error("Missing required env vars (MEDIA_ID, CALLBACK_URL, SOURCE_URL)");
     process.exit(1);
   }
 
@@ -520,8 +558,20 @@ async function main() {
   const reduction = originalSize > 0 ? ((1 - totalSize / originalSize) * 100).toFixed(1) : 0;
   log(`Size reduction: ${reduction}% (${(originalSize / 1024 / 1024).toFixed(1)} MB → ${(totalSize / 1024 / 1024).toFixed(1)} MB)`);
 
-  const hlsData = await uploadHLS(files);
-  await callback(hlsData, originalSize);
+  // Upload to VPS (primary, instant playback) and SpaceByte (backup) in parallel
+  const [vpsResult, sbResult] = await Promise.allSettled([
+    uploadToVPS(files),
+    uploadToSpaceByte(files)
+  ]);
+
+  if (vpsResult.status === "rejected") {
+    throw new Error(`VPS upload failed: ${vpsResult.reason?.message || vpsResult.reason}`);
+  }
+
+  const sbData = sbResult.status === "fulfilled" ? sbResult.value : null;
+  if (!sbData) log("Warning: SpaceByte backup failed — VPS-only mode");
+
+  await callback(vpsResult.value, sbData, originalSize);
 
   try { fs.rmSync(HLS_DIR, { recursive: true, force: true }); } catch (_) {}
   log("=== Done! ===");
