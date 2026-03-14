@@ -1,4 +1,4 @@
-name: HLS Compress Video 540p
+name: HLS Compress Video 480p
 
 on:
   workflow_dispatch:
@@ -44,13 +44,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm install axios form-data
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          npm install axios
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg libx265-dev
 
       - name: Verify FFmpeg
         run: |
           which ffmpeg
           ffmpeg -version | head -1
+          ffmpeg -encoders 2>/dev/null | grep libx265 || echo 'WARNING: libx265 not found'
 
       - name: Run HLS compression + upload
         env:
