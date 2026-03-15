@@ -563,11 +563,45 @@ async function main() {
   let originalSize;
   if (sourceType === "youtube") {
     originalSize = await downloadYouTube(SOURCE_URL);
-  } else {
-    if (sourceType === "vcloud") {
-      resolvedUrl = await resolveVcloudUrl(SOURCE_URL);
+  } else if (sourceType === "vcloud") {
+    // vcloud links can expire — retry with fresh resolve up to 3 times
+    const MAX_RESOLVE_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_RESOLVE_RETRIES; attempt++) {
+      try {
+        resolvedUrl = await resolveVcloudUrl(SOURCE_URL);
+        // Clean up any partial file from previous attempt
+        try { if (fs.existsSync(INPUT_FILE)) fs.unlinkSync(INPUT_FILE); } catch (_) {}
+        originalSize = await download(resolvedUrl);
+        break; // success
+      } catch (err) {
+        log(`Download attempt ${attempt}/${MAX_RESOLVE_RETRIES} failed: ${err.message.slice(0, 150)}`);
+        if (attempt === MAX_RESOLVE_RETRIES) throw new Error(`Download failed after ${MAX_RESOLVE_RETRIES} resolve attempts: ${err.message}`);
+        // Wait before re-resolving for a fresh link
+        const wait = 5000 * attempt;
+        log(`Re-resolving vcloud.zip link in ${wait / 1000}s...`);
+        updateProgress({ phase: "resolving", percent: 0, detail: `Retry ${attempt}/${MAX_RESOLVE_RETRIES} — re-resolving link...` });
+        await sendProgress(true);
+        await new Promise(r => setTimeout(r, wait));
+      }
     }
-    originalSize = await download(resolvedUrl);
+  } else {
+    // Direct download — retry with same URL up to 3 times
+    const MAX_DIRECT_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_DIRECT_RETRIES; attempt++) {
+      try {
+        try { if (fs.existsSync(INPUT_FILE)) fs.unlinkSync(INPUT_FILE); } catch (_) {}
+        originalSize = await download(resolvedUrl);
+        break;
+      } catch (err) {
+        log(`Download attempt ${attempt}/${MAX_DIRECT_RETRIES} failed: ${err.message.slice(0, 150)}`);
+        if (attempt === MAX_DIRECT_RETRIES) throw new Error(`Download failed after ${MAX_DIRECT_RETRIES} attempts: ${err.message}`);
+        const wait = 5000 * attempt;
+        log(`Retrying download in ${wait / 1000}s...`);
+        updateProgress({ phase: "downloading", percent: 0, detail: `Retry ${attempt}/${MAX_DIRECT_RETRIES}...` });
+        await sendProgress(true);
+        await new Promise(r => setTimeout(r, wait));
+      }
+    }
   }
 
   const { outputSize } = await encodeMP4();
