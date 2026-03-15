@@ -8,6 +8,7 @@
  * Supports source URL types:
  *   - Direct download URLs
  *   - vcloud.zip links (auto-resolved to direct download)
+ *   - nexdrive.pro links (extracts vcloud.zip/fastdl.zip, then resolves)
  *   - YouTube share links (downloaded via yt-dlp)
  *
  * Sends real-time progress updates to VPS every second via PROGRESS_URL.
@@ -107,6 +108,7 @@ async function withRetry(fn, label = "", maxRetries = 5) {
 function detectSourceType(url) {
   if (/^https?:\/\/(www\.)?youtube\.com\/|^https?:\/\/youtu\.be\//i.test(url)) return "youtube";
   if (/^https?:\/\/(www\.)?vcloud\.zip\//i.test(url)) return "vcloud";
+  if (/^https?:\/\/(www\.)?nexdrive\.pro\//i.test(url)) return "nexdrive";
   return "direct";
 }
 
@@ -143,6 +145,67 @@ async function resolveVcloudUrl(url) {
 
   const directUrl = match2[1];
   log(`vcloud.zip resolved → ${directUrl.slice(0, 100)}...`);
+  updateProgress({ phase: "resolving", percent: 100, detail: "Link resolved" });
+  await sendProgress(true);
+  return directUrl;
+}
+
+// ─── nexdrive.pro Resolver (extract vcloud/fastdl link) ─
+async function resolveNexdriveUrl(url) {
+  log("Resolving nexdrive.pro link...");
+  updateProgress({ phase: "resolving", percent: 0, detail: "Fetching nexdrive.pro page..." });
+
+  const page = await withRetry(() => axios.get(url, {
+    timeout: 30000,
+    maxRedirects: 5,
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+  }), "nexdrive page");
+
+  const html = page.data;
+
+  // Priority 1: Extract vcloud.zip link
+  const vcloudMatch = html.match(/https?:\/\/(www\.)?vcloud\.zip\/[^"'<>\s]+/i);
+  if (vcloudMatch) {
+    const vcloudUrl = vcloudMatch[0];
+    log(`nexdrive.pro → vcloud.zip: ${vcloudUrl}`);
+    updateProgress({ phase: "resolving", percent: 30, detail: "Found vcloud.zip link, resolving..." });
+    return { type: "vcloud", url: vcloudUrl };
+  }
+
+  // Priority 2: Extract fastdl.zip link
+  const fastdlMatch = html.match(/https?:\/\/(www\.)?fastdl\.zip\/[^"'<>\s]+/i);
+  if (fastdlMatch) {
+    const fastdlUrl = fastdlMatch[0];
+    log(`nexdrive.pro → fastdl.zip: ${fastdlUrl}`);
+    updateProgress({ phase: "resolving", percent: 30, detail: "Found fastdl.zip link, resolving..." });
+    return { type: "fastdl", url: fastdlUrl };
+  }
+
+  throw new Error("nexdrive.pro: Could not find vcloud.zip or fastdl.zip link on page");
+}
+
+// ─── fastdl.zip Resolver ────────────────────────────
+async function resolveFastdlUrl(url) {
+  log("Resolving fastdl.zip link...");
+  updateProgress({ phase: "resolving", percent: 50, detail: "Resolving fastdl.zip link..." });
+
+  const page = await withRetry(() => axios.get(url, {
+    timeout: 30000,
+    maxRedirects: 5,
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+  }), "fastdl page");
+
+  // fastdl.zip pages typically have a direct download link in a var or anchor
+  const match = page.data.match(/var\s+url\s*=\s*'([^']+)'/)
+    || page.data.match(/var\s+url\s*=\s*"([^"]+)"/)
+    || page.data.match(/href\s*=\s*"(https?:\/\/[^"]+\.mp4[^"]*)"/i)
+    || page.data.match(/href\s*=\s*'(https?:\/\/[^']+\.mp4[^']*)'/i)
+    || page.data.match(/source\s+src\s*=\s*"(https?:\/\/[^"]+)"/i);
+
+  if (!match) throw new Error("fastdl.zip: Could not extract direct URL");
+
+  const directUrl = match[1];
+  log(`fastdl.zip resolved → ${directUrl.slice(0, 100)}...`);
   updateProgress({ phase: "resolving", percent: 100, detail: "Link resolved" });
   await sendProgress(true);
   return directUrl;
@@ -563,6 +626,31 @@ async function main() {
   let originalSize;
   if (sourceType === "youtube") {
     originalSize = await downloadYouTube(SOURCE_URL);
+  } else if (sourceType === "nexdrive") {
+    // nexdrive.pro → extract inner link → resolve → download (with retries)
+    const MAX_RESOLVE_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_RESOLVE_RETRIES; attempt++) {
+      try {
+        const inner = await resolveNexdriveUrl(SOURCE_URL);
+        let directUrl;
+        if (inner.type === "vcloud") {
+          directUrl = await resolveVcloudUrl(inner.url);
+        } else {
+          directUrl = await resolveFastdlUrl(inner.url);
+        }
+        try { if (fs.existsSync(INPUT_FILE)) fs.unlinkSync(INPUT_FILE); } catch (_) {}
+        originalSize = await download(directUrl);
+        break;
+      } catch (err) {
+        log(`Download attempt ${attempt}/${MAX_RESOLVE_RETRIES} failed: ${err.message.slice(0, 150)}`);
+        if (attempt === MAX_RESOLVE_RETRIES) throw new Error(`Download failed after ${MAX_RESOLVE_RETRIES} resolve attempts: ${err.message}`);
+        const wait = 5000 * attempt;
+        log(`Re-resolving nexdrive.pro link in ${wait / 1000}s...`);
+        updateProgress({ phase: "resolving", percent: 0, detail: `Retry ${attempt}/${MAX_RESOLVE_RETRIES} — re-resolving link...` });
+        await sendProgress(true);
+        await new Promise(r => setTimeout(r, wait));
+      }
+    }
   } else if (sourceType === "vcloud") {
     // vcloud links can expire — retry with fresh resolve up to 3 times
     const MAX_RESOLVE_RETRIES = 3;
