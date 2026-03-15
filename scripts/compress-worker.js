@@ -10,6 +10,7 @@
  *   - vcloud.zip links (auto-resolved to direct download)
  *   - nexdrive.pro links (extracts vcloud.zip/fastdl.zip, then resolves)
  *   - YouTube share links (downloaded via yt-dlp)
+ *   - Magnet links (downloaded via aria2c torrent)
  *
  * Sends real-time progress updates to VPS every second via PROGRESS_URL.
  *
@@ -106,6 +107,7 @@ async function withRetry(fn, label = "", maxRetries = 5) {
 
 // ─── URL Type Detection ─────────────────────────────
 function detectSourceType(url) {
+  if (/^magnet:\?/i.test(url)) return "magnet";
   if (/^https?:\/\/(www\.)?youtube\.com\/|^https?:\/\/youtu\.be\//i.test(url)) return "youtube";
   if (/^https?:\/\/(www\.)?vcloud\.zip\//i.test(url)) return "vcloud";
   if (/^https?:\/\/(www\.)?nexdrive\.pro\//i.test(url)) return "nexdrive";
@@ -294,6 +296,111 @@ async function downloadYouTube(url) {
       }
     });
     child.on("error", (err) => reject(new Error(`yt-dlp not found or error: ${err.message}`)));
+  });
+}
+
+// ─── Magnet/Torrent Downloader (aria2c) ─────────────
+async function downloadTorrent(magnetUrl) {
+  log(`Downloading torrent: ${magnetUrl.slice(0, 80)}...`);
+  updateProgress({ phase: "downloading", percent: 0, detail: "Starting torrent download via aria2c..." });
+  await sendProgress(true);
+
+  const torrentDir = path.join(TEMP_DIR, "torrent");
+  fs.mkdirSync(torrentDir, { recursive: true });
+
+  const args = [
+    magnetUrl,
+    "--dir=" + torrentDir,
+    "--seed-time=0",
+    "--max-connection-per-server=16",
+    "--split=16",
+    "--min-split-size=1M",
+    "--bt-max-peers=100",
+    "--bt-request-peer-speed-limit=0",
+    "--bt-tracker-connect-timeout=10",
+    "--bt-stop-timeout=600",
+    "--file-allocation=none",
+    "--summary-interval=5",
+    "--console-log-level=notice",
+    "--allow-overwrite=true",
+    "--bt-enable-lpd=true",
+    "--enable-dht=true",
+    "--enable-dht6=true",
+    "--dht-listen-port=6881-6999",
+    "--listen-port=6881-6999"
+  ];
+
+  return new Promise((resolve, reject) => {
+    const child = spawn("aria2c", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+    let lastPct = 0;
+
+    child.stdout.on("data", (data) => {
+      const lines = data.toString().split("\n");
+      for (const line of lines) {
+        // aria2c progress: [#hash SIZE:1.2GiB/3.5GiB(34%) ...]
+        const m = line.match(/\((\d+)%\)/);
+        if (m) {
+          const pct = parseInt(m[1]);
+          if (pct !== lastPct) {
+            lastPct = pct;
+            // Extract speed DL:XX
+            const dl = line.match(/DL:([\d.]+\w+)/);
+            const speed = dl ? dl[1] : "";
+            updateProgress({
+              phase: "downloading",
+              percent: Math.min(99, pct),
+              detail: `Torrent: ${pct}%${speed ? " at " + speed + "/s" : ""}`
+            });
+          }
+        }
+      }
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d.toString();
+      if (stderr.length > 4000) stderr = stderr.slice(-4000);
+    });
+
+    child.on("close", (code) => {
+      if (code !== 0 && code !== null) {
+        return reject(new Error(`aria2c failed (code ${code}): ${stderr.slice(-300)}`));
+      }
+
+      // Find the largest video file in the download directory
+      const videoExts = new Set([".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".ts", ".m4v"]);
+      let bestFile = null;
+      let bestSize = 0;
+
+      function scanDir(dir) {
+        for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+          const fullPath = path.join(dir, entry.name);
+          if (entry.isDirectory()) { scanDir(fullPath); continue; }
+          const ext = path.extname(entry.name).toLowerCase();
+          if (!videoExts.has(ext)) continue;
+          const size = fs.statSync(fullPath).size;
+          if (size > bestSize) { bestSize = size; bestFile = fullPath; }
+        }
+      }
+      scanDir(torrentDir);
+
+      if (!bestFile || bestSize < 10000) {
+        return reject(new Error("Torrent download completed but no video file found"));
+      }
+
+      log(`Torrent video: ${path.basename(bestFile)} (${(bestSize / 1024 / 1024).toFixed(1)} MB)`);
+
+      // Move the video to INPUT_FILE
+      fs.copyFileSync(bestFile, INPUT_FILE);
+      // Cleanup torrent dir
+      fs.rmSync(torrentDir, { recursive: true, force: true });
+
+      const size = fs.statSync(INPUT_FILE).size;
+      log(`Torrent download complete: ${(size / 1024 / 1024).toFixed(1)} MB`);
+      updateProgress({ phase: "downloading", percent: 100, detail: `${(size / 1024 / 1024).toFixed(1)} MB downloaded via torrent` });
+      sendProgress(true);
+      resolve(size);
+    });
+    child.on("error", (err) => reject(new Error(`aria2c not found: ${err.message}`)));
   });
 }
 
@@ -652,7 +759,9 @@ async function main() {
   log(`Source type: ${sourceType}`);
 
   let originalSize;
-  if (sourceType === "youtube") {
+  if (sourceType === "magnet") {
+    originalSize = await downloadTorrent(SOURCE_URL);
+  } else if (sourceType === "youtube") {
     originalSize = await downloadYouTube(SOURCE_URL);
   } else if (sourceType === "nexdrive") {
     // nexdrive.pro → extract all source links → try each, cycle up to 5 times
