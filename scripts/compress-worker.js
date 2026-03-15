@@ -2,8 +2,13 @@
 /**
  * compress-worker.js — GitHub Actions video compression worker
  *
- * Downloads video → FFmpeg encode to H.265 480p MP4 (faststart) →
+ * Downloads video → FFmpeg encode to H.265 720p MP4 (faststart) →
  * Uploads MP4 to VPS → Calls VPS callback.
+ *
+ * Supports source URL types:
+ *   - Direct download URLs
+ *   - vcloud.zip links (auto-resolved to direct download)
+ *   - YouTube share links (downloaded via yt-dlp)
  *
  * Sends real-time progress updates to VPS every second via PROGRESS_URL.
  *
@@ -98,20 +103,123 @@ async function withRetry(fn, label = "", maxRetries = 5) {
   }
 }
 
+// ─── URL Type Detection ─────────────────────────────
+function detectSourceType(url) {
+  if (/^https?:\/\/(www\.)?youtube\.com\/|^https?:\/\/youtu\.be\//i.test(url)) return "youtube";
+  if (/^https?:\/\/(www\.)?vcloud\.zip\//i.test(url)) return "vcloud";
+  return "direct";
+}
+
+// ─── vcloud.zip Resolver (2-step extraction) ────────
+async function resolveVcloudUrl(url) {
+  log("Resolving vcloud.zip link (step 1)...");
+  updateProgress({ phase: "resolving", percent: 10, detail: "Resolving vcloud.zip link..." });
+
+  // Step 1: Fetch vcloud.zip page → extract intermediate URL
+  const page1 = await withRetry(() => axios.get(url, {
+    timeout: 30000,
+    maxRedirects: 5,
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+  }), "vcloud page1");
+
+  const match1 = page1.data.match(/var\s+url\s*=\s*'([^']+)'/)
+    || page1.data.match(/var\s+url\s*=\s*"([^"]+)"/);
+  if (!match1) throw new Error("vcloud.zip: Could not extract intermediate URL from page 1");
+
+  const intermediateUrl = match1[1];
+  log(`vcloud.zip step 1 → ${intermediateUrl.slice(0, 80)}...`);
+  updateProgress({ phase: "resolving", percent: 50, detail: "Extracting direct link..." });
+
+  // Step 2: Fetch intermediate page → extract direct download URL
+  const page2 = await withRetry(() => axios.get(intermediateUrl, {
+    timeout: 30000,
+    maxRedirects: 5,
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+  }), "vcloud page2");
+
+  const match2 = page2.data.match(/var\s+url\s*=\s*'([^']+)'/)
+    || page2.data.match(/var\s+url\s*=\s*"([^"]+)"/);
+  if (!match2) throw new Error("vcloud.zip: Could not extract direct URL from page 2");
+
+  const directUrl = match2[1];
+  log(`vcloud.zip resolved → ${directUrl.slice(0, 100)}...`);
+  updateProgress({ phase: "resolving", percent: 100, detail: "Link resolved" });
+  await sendProgress(true);
+  return directUrl;
+}
+
+// ─── YouTube Download (yt-dlp) ──────────────────────
+async function downloadYouTube(url) {
+  log(`Downloading from YouTube: ${url}`);
+  updateProgress({ phase: "downloading", percent: 0, detail: "Downloading from YouTube via yt-dlp..." });
+  await sendProgress(true);
+
+  // Download best video+audio up to source quality (yt-dlp will merge to mkv/mp4)
+  const args = [
+    "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+    "--merge-output-format", "mp4",
+    "-o", INPUT_FILE,
+    "--no-playlist",
+    "--no-check-certificates",
+    "--retries", "3",
+    "--socket-timeout", "30",
+    url
+  ];
+
+  return new Promise((resolve, reject) => {
+    const child = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      const text = chunk.toString();
+      // Parse yt-dlp progress: [download]  45.2% of ~500MiB at 10.5MiB/s ETA 00:25
+      const pctMatch = text.match(/(\d+\.?\d*)%/);
+      if (pctMatch) {
+        const pct = parseFloat(pctMatch[1]);
+        const speedMatch = text.match(/at\s+([\d.]+\S+)/);
+        const etaMatch = text.match(/ETA\s+(\S+)/);
+        updateProgress({
+          phase: "downloading",
+          percent: Math.min(99, Math.round(pct * 10) / 10),
+          detail: `YouTube: ${pct.toFixed(1)}%${speedMatch ? " at " + speedMatch[1] : ""}${etaMatch ? " ETA " + etaMatch[1] : ""}`
+        });
+      }
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+      if (stderr.length > 4000) stderr = stderr.slice(-4000);
+    });
+
+    child.on("close", (code) => {
+      if (code === 0 && fs.existsSync(INPUT_FILE)) {
+        const size = fs.statSync(INPUT_FILE).size;
+        log(`YouTube download complete: ${(size / 1024 / 1024).toFixed(1)} MB`);
+        updateProgress({ phase: "downloading", percent: 100, detail: `${(size / 1024 / 1024).toFixed(1)} MB downloaded` });
+        sendProgress(true);
+        resolve(size);
+      } else {
+        reject(new Error(`yt-dlp failed (code ${code}): ${stderr.slice(-300)}`));
+      }
+    });
+    child.on("error", (err) => reject(new Error(`yt-dlp not found or error: ${err.message}`)));
+  });
+}
+
 // ─── Step 1: Download source video (parallel chunks) ─
-async function download() {
-  log(`Downloading from: ${SOURCE_URL.slice(0, 80)}...`);
+async function download(downloadUrl) {
+  log(`Downloading from: ${downloadUrl.slice(0, 80)}...`);
   updateProgress({ phase: "downloading", percent: 0, detail: "Checking source..." });
 
   // HEAD request to get content-length and check Range support
   let totalBytes = 0;
   let acceptsRanges = false;
   try {
-    const head = await withRetry(() => axios.head(SOURCE_URL, { timeout: 30000, maxRedirects: 5 }), "HEAD");
+    const head = await withRetry(() => axios.head(downloadUrl, { timeout: 30000, maxRedirects: 5 }), "HEAD");
     totalBytes = parseInt(head.headers["content-length"] || "0", 10);
     acceptsRanges = (head.headers["accept-ranges"] || "").toLowerCase() === "bytes";
   } catch (_) {
-    const probe = await withRetry(() => axios.get(SOURCE_URL, { responseType: "stream", timeout: 30000, maxRedirects: 5 }), "probe");
+    const probe = await withRetry(() => axios.get(downloadUrl, { responseType: "stream", timeout: 30000, maxRedirects: 5 }), "probe");
     totalBytes = parseInt(probe.headers["content-length"] || "0", 10);
     acceptsRanges = (probe.headers["accept-ranges"] || "").toLowerCase() === "bytes";
     probe.data.destroy();
@@ -121,9 +229,9 @@ async function download() {
 
   // Use parallel chunked download if Range is supported and file is large enough
   if (acceptsRanges && totalBytes > DOWNLOAD_CHUNK_SIZE * 2) {
-    await downloadParallel(totalBytes);
+    await downloadParallel(downloadUrl, totalBytes);
   } else {
-    await downloadSingle(totalBytes);
+    await downloadSingle(downloadUrl, totalBytes);
   }
 
   const size = fs.statSync(INPUT_FILE).size;
@@ -133,11 +241,11 @@ async function download() {
   return size;
 }
 
-async function downloadSingle(totalBytes) {
+async function downloadSingle(downloadUrl, totalBytes) {
   log("Downloading (single stream)...");
   updateProgress({ phase: "downloading", percent: 0, detail: "Downloading..." });
 
-  const resp = await withRetry(() => axios.get(SOURCE_URL, {
+  const resp = await withRetry(() => axios.get(downloadUrl, {
     responseType: "stream", timeout: 600000, maxRedirects: 5
   }), "download");
 
@@ -173,7 +281,7 @@ async function downloadSingle(totalBytes) {
   });
 }
 
-async function downloadParallel(totalBytes) {
+async function downloadParallel(downloadUrl, totalBytes) {
   // Split into chunks
   const chunks = [];
   for (let start = 0; start < totalBytes; start += DOWNLOAD_CHUNK_SIZE) {
@@ -194,7 +302,7 @@ async function downloadParallel(totalBytes) {
   const downloadStart = Date.now();
 
   async function downloadChunk(chunk) {
-    const resp = await withRetry(() => axios.get(SOURCE_URL, {
+    const resp = await withRetry(() => axios.get(downloadUrl, {
       responseType: "arraybuffer",
       timeout: 300000,
       maxRedirects: 5,
@@ -243,7 +351,7 @@ async function downloadParallel(totalBytes) {
 
 // ─── Step 2: FFmpeg encode to H.265 480p MP4 (faststart) ─
 async function encodeMP4() {
-  log("Encoding to H.265 480p MP4 (faststart)...");
+  log("Encoding to H.265 720p MP4 (faststart)...");
 
   updateProgress({ phase: "converting", percent: 0, speed: null, eta: null, detail: "Probing input..." });
   await sendProgress(true);
@@ -290,8 +398,8 @@ async function encodeMP4() {
     }
   }
 
-  // Choose output height: cap at 480p, keep original if already smaller
-  const targetHeight = Math.min(480, inputHeight || 480);
+  // Choose output height: cap at 720p, keep original if already smaller
+  const targetHeight = Math.min(720, inputHeight || 720);
 
   const args = [
     "-y", "-i", INPUT_FILE,
@@ -448,7 +556,21 @@ async function main() {
   fs.mkdirSync(TEMP_DIR, { recursive: true });
   log(`=== Compress: ${MEDIA_ID} (job ${JOB_ID}) ===`);
 
-  const originalSize = await download();
+  // Detect source URL type and resolve/download accordingly
+  let resolvedUrl = SOURCE_URL;
+  const sourceType = detectSourceType(SOURCE_URL);
+  log(`Source type: ${sourceType}`);
+
+  let originalSize;
+  if (sourceType === "youtube") {
+    originalSize = await downloadYouTube(SOURCE_URL);
+  } else {
+    if (sourceType === "vcloud") {
+      resolvedUrl = await resolveVcloudUrl(SOURCE_URL);
+    }
+    originalSize = await download(resolvedUrl);
+  }
+
   const { outputSize } = await encodeMP4();
 
   const reduction = originalSize > 0 ? ((1 - outputSize / originalSize) * 100).toFixed(1) : 0;
