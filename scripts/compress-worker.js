@@ -42,7 +42,7 @@ const TEMP_DIR = "/tmp/compress";
 const INPUT_FILE = path.join(TEMP_DIR, "input.mp4");
 const HLS_DIR = path.join(TEMP_DIR, "hls");
 
-const PARALLEL_UPLOADS = 30;
+const PARALLEL_UPLOADS = 10;
 const PARALLEL_DOWNLOAD_CHUNKS = 4;
 const DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB per chunk
 const PROGRESS_INTERVAL = 1000; // 1 second
@@ -82,16 +82,19 @@ function updateProgress(updates) {
   sendProgress();
 }
 
-// ─── Retry helper for 429 rate limits ──────────────
+// ─── Retry helper for transient errors ──────────────
+const RETRYABLE_CODES = new Set([429, 408, 500, 502, 503, 504, 522, 524]);
 async function withRetry(fn, label = "", maxRetries = 5) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       return await fn();
     } catch (err) {
-      if (err.response?.status === 429 && attempt < maxRetries) {
-        const retryAfter = parseInt(err.response.headers["retry-after"] || "0", 10);
+      const status = err.response?.status;
+      const isRetryable = RETRYABLE_CODES.has(status) || err.code === "ECONNRESET" || err.code === "ETIMEDOUT" || err.code === "ECONNABORTED";
+      if (isRetryable && attempt < maxRetries) {
+        const retryAfter = parseInt(err.response?.headers?.["retry-after"] || "0", 10);
         const wait = retryAfter > 0 ? retryAfter * 1000 : Math.min(3000 * Math.pow(2, attempt), 60000);
-        log(`  429 rate limit${label ? " (" + label + ")" : ""}, waiting ${(wait/1000).toFixed(0)}s (attempt ${attempt+1}/${maxRetries})`);
+        log(`  ${status || err.code} ${label ? "(" + label + ") " : ""}waiting ${(wait/1000).toFixed(0)}s (attempt ${attempt+1}/${maxRetries})`);
         await new Promise(r => setTimeout(r, wait));
         continue;
       }
@@ -397,9 +400,9 @@ async function getOrCreateCategoryFolder() {
   try {
     const params = { per_page: 100 };
     if (parentId) params.parentIds = parentId;
-    const resp = await axios.get(`${SB_API}/drive/file-entries`, {
-      headers: sbHeaders(), params, timeout: 15000
-    });
+    const resp = await withRetry(() => axios.get(`${SB_API}/drive/file-entries`, {
+      headers: sbHeaders(), params, timeout: 30000
+    }), "list folders");
     const entries = resp.data?.data || [];
     const existing = entries.find(f =>
       f.type === "folder" && (f.name || "").toLowerCase() === categoryName.toLowerCase()
@@ -417,9 +420,9 @@ async function getOrCreateCategoryFolder() {
   if (parentId) body.parentId = String(parentId);
   log(`Creating "${categoryName}" folder${parentId ? ` under parent ${parentId}` : " at root"}`);
 
-  const resp = await axios.post(`${SB_API}/folders`, body, {
-    headers: sbHeaders(), timeout: 15000
-  });
+  const resp = await withRetry(() => axios.post(`${SB_API}/folders`, body, {
+    headers: sbHeaders(), timeout: 30000
+  }), "create category folder");
 
   const id = resp.data?.folder?.id || resp.data?.id || resp.data?.data?.id;
   if (!id) throw new Error(`Failed to create ${categoryName} folder: ${JSON.stringify(resp.data).slice(0, 300)}`);
@@ -436,9 +439,9 @@ async function uploadToSpaceByte(hlsFiles) {
   const categoryFolderId = await getOrCreateCategoryFolder();
   const folderName = `hls_${FILE_NAME}_${Date.now()}`.slice(0, 200);
 
-  const folderResp = await axios.post(`${SB_API}/folders`, {
+  const folderResp = await withRetry(() => axios.post(`${SB_API}/folders`, {
     name: folderName, parentId: categoryFolderId
-  }, { headers: sbHeaders(), timeout: 15000 });
+  }, { headers: sbHeaders(), timeout: 30000 }), "create HLS folder");
 
   const folderId = folderResp.data?.folder?.id || folderResp.data?.id || folderResp.data?.data?.id;
   if (!folderId) throw new Error(`SpaceByte folder creation failed`);
@@ -459,23 +462,23 @@ async function uploadToSpaceByte(hlsFiles) {
     const ext = fileName.split(".").pop();
 
     // Get presigned S3 URL
-    const presign = await axios.post(`${SB_API}/s3/simple/presign`, {
+    const presign = await withRetry(() => axios.post(`${SB_API}/s3/simple/presign`, {
       filename: fileName, mime: contentType, size: fileData.length, extension: ext
-    }, { headers: sbHeaders(), timeout: 20000 });
+    }, { headers: sbHeaders(), timeout: 30000 }), `presign ${fileName}`);
 
     const { url, key, acl } = presign.data;
 
     // Upload directly to S3
-    await axios.put(url, fileData, {
+    await withRetry(() => axios.put(url, fileData, {
       headers: { "Content-Type": contentType, "x-amz-acl": acl },
-      maxContentLength: Infinity, maxBodyLength: Infinity, timeout: 120000
-    });
+      maxContentLength: Infinity, maxBodyLength: Infinity, timeout: 180000
+    }), `s3put ${fileName}`, 3);
 
     // Register file entry in SpaceByte
-    const entry = await axios.post(`${SB_API}/s3/entries`, {
+    const entry = await withRetry(() => axios.post(`${SB_API}/s3/entries`, {
       filename: key, parentId: String(folderId), size: fileData.length,
       mime: contentType, clientMime: contentType, clientName: fileName, clientExtension: ext
-    }, { headers: sbHeaders(), timeout: 20000 });
+    }, { headers: sbHeaders(), timeout: 30000 }), `register ${fileName}`);
 
     const id = entry.data?.fileEntry?.id;
     if (id) fileMap[fileName] = String(id);
@@ -500,10 +503,8 @@ async function uploadToSpaceByte(hlsFiles) {
     while (active.size < PARALLEL_UPLOADS && queue.length > 0) {
       const fileName = queue.shift();
       const p = uploadOne(fileName).catch(err => {
-        log(`  Retry SB: ${fileName} (${err.message.slice(0, 80)})`);
-        return uploadOne(fileName).catch(err2 => {
-          log(`  SB skip: ${fileName} (${err2.message.slice(0, 60)})`);
-        });
+        log(`  Upload failed: ${fileName} (${err.message.slice(0, 100)})`);
+        throw err; // withRetry inside uploadOne already handles retries
       });
       active.add(p);
       p.finally(() => active.delete(p));
@@ -522,7 +523,7 @@ async function callback(sbData, originalSize) {
   updateProgress({ phase: "done", percent: 100, detail: "Sending results..." });
   await sendProgress(true);
 
-  const resp = await axios.post(CALLBACK_URL, {
+  const resp = await withRetry(() => axios.post(CALLBACK_URL, {
     mediaId: MEDIA_ID,
     jobId: JOB_ID,
     hls: {
@@ -535,9 +536,9 @@ async function callback(sbData, originalSize) {
     originalSize,
     secret: SECRET
   }, {
-    timeout: 30000,
+    timeout: 60000,
     headers: { "Content-Type": "application/json" }
-  });
+  }), "VPS callback", 3);
 
   if (resp.data?.ok) log("VPS confirmed");
   else log(`VPS response: ${JSON.stringify(resp.data).slice(0, 300)}`);
