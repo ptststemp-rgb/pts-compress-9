@@ -150,9 +150,9 @@ async function resolveVcloudUrl(url) {
   return directUrl;
 }
 
-// ─── nexdrive.pro Resolver (extract vcloud/fastdl link) ─
-async function resolveNexdriveUrl(url) {
-  log("Resolving nexdrive.pro link...");
+// ─── nexdrive.pro Resolver (extract all source links) ─
+async function resolveNexdriveLinks(url) {
+  log("Fetching nexdrive.pro page for source links...");
   updateProgress({ phase: "resolving", percent: 0, detail: "Fetching nexdrive.pro page..." });
 
   const page = await withRetry(() => axios.get(url, {
@@ -162,26 +162,28 @@ async function resolveNexdriveUrl(url) {
   }), "nexdrive page");
 
   const html = page.data;
+  const sources = [];
 
-  // Priority 1: Extract vcloud.zip link
+  // Extract all known source links in priority order
   const vcloudMatch = html.match(/https?:\/\/(www\.)?vcloud\.zip\/[^"'<>\s]+/i);
-  if (vcloudMatch) {
-    const vcloudUrl = vcloudMatch[0];
-    log(`nexdrive.pro → vcloud.zip: ${vcloudUrl}`);
-    updateProgress({ phase: "resolving", percent: 30, detail: "Found vcloud.zip link, resolving..." });
-    return { type: "vcloud", url: vcloudUrl };
-  }
+  if (vcloudMatch) sources.push({ type: "vcloud", url: vcloudMatch[0] });
 
-  // Priority 2: Extract fastdl.zip link
   const fastdlMatch = html.match(/https?:\/\/(www\.)?fastdl\.zip\/[^"'<>\s]+/i);
-  if (fastdlMatch) {
-    const fastdlUrl = fastdlMatch[0];
-    log(`nexdrive.pro → fastdl.zip: ${fastdlUrl}`);
-    updateProgress({ phase: "resolving", percent: 30, detail: "Found fastdl.zip link, resolving..." });
-    return { type: "fastdl", url: fastdlUrl };
-  }
+  if (fastdlMatch) sources.push({ type: "fastdl", url: fastdlMatch[0] });
 
-  throw new Error("nexdrive.pro: Could not find vcloud.zip or fastdl.zip link on page");
+  const filebeeMatch = html.match(/https?:\/\/(www\.)?filebee\.xyz\/[^"'<>\s]+/i);
+  if (filebeeMatch) sources.push({ type: "direct", url: filebeeMatch[0] });
+
+  const dropgalaxyMatch = html.match(/https?:\/\/(www\.)?dropgalaxy\.vip\/[^"'<>\s]+/i);
+  if (dropgalaxyMatch) sources.push({ type: "direct", url: dropgalaxyMatch[0] });
+
+  const gdtotMatch = html.match(/https?:\/\/(www\.|new\d+\.)?gdtot\.[^"'<>\s]+/i);
+  if (gdtotMatch) sources.push({ type: "direct", url: gdtotMatch[0] });
+
+  if (sources.length === 0) throw new Error("nexdrive.pro: No download source links found on page");
+
+  log(`nexdrive.pro: Found ${sources.length} sources: ${sources.map(s => s.type + "=" + s.url.split("/")[2]).join(", ")}`);
+  return sources;
 }
 
 // ─── fastdl.zip Resolver ────────────────────────────
@@ -627,27 +629,33 @@ async function main() {
   if (sourceType === "youtube") {
     originalSize = await downloadYouTube(SOURCE_URL);
   } else if (sourceType === "nexdrive") {
-    // nexdrive.pro → extract inner link → resolve → download (with retries)
-    const MAX_RESOLVE_RETRIES = 3;
-    for (let attempt = 1; attempt <= MAX_RESOLVE_RETRIES; attempt++) {
+    // nexdrive.pro → extract all source links → try each, cycle up to 5 times
+    const MAX_NEXDRIVE_RETRIES = 5;
+    const sources = await resolveNexdriveLinks(SOURCE_URL);
+    let downloaded = false;
+    for (let attempt = 1; attempt <= MAX_NEXDRIVE_RETRIES && !downloaded; attempt++) {
+      const sourceIdx = (attempt - 1) % sources.length;
+      const source = sources[sourceIdx];
+      log(`Attempt ${attempt}/${MAX_NEXDRIVE_RETRIES}: trying ${source.type} (${source.url.slice(0, 60)}...)`);
+      updateProgress({ phase: "resolving", percent: 0, detail: `Attempt ${attempt}/${MAX_NEXDRIVE_RETRIES} — ${source.type} source...` });
+      await sendProgress(true);
       try {
-        const inner = await resolveNexdriveUrl(SOURCE_URL);
         let directUrl;
-        if (inner.type === "vcloud") {
-          directUrl = await resolveVcloudUrl(inner.url);
+        if (source.type === "vcloud") {
+          directUrl = await resolveVcloudUrl(source.url);
+        } else if (source.type === "fastdl") {
+          directUrl = await resolveFastdlUrl(source.url);
         } else {
-          directUrl = await resolveFastdlUrl(inner.url);
+          directUrl = source.url; // direct link (filebee, dropgalaxy, gdtot)
         }
         try { if (fs.existsSync(INPUT_FILE)) fs.unlinkSync(INPUT_FILE); } catch (_) {}
         originalSize = await download(directUrl);
-        break;
+        downloaded = true;
       } catch (err) {
-        log(`Download attempt ${attempt}/${MAX_RESOLVE_RETRIES} failed: ${err.message.slice(0, 150)}`);
-        if (attempt === MAX_RESOLVE_RETRIES) throw new Error(`Download failed after ${MAX_RESOLVE_RETRIES} resolve attempts: ${err.message}`);
+        log(`Attempt ${attempt}/${MAX_NEXDRIVE_RETRIES} failed (${source.type}): ${err.message.slice(0, 150)}`);
+        if (attempt === MAX_NEXDRIVE_RETRIES) throw new Error(`nexdrive download failed after ${MAX_NEXDRIVE_RETRIES} attempts across ${sources.length} sources: ${err.message}`);
         const wait = 5000 * attempt;
-        log(`Re-resolving nexdrive.pro link in ${wait / 1000}s...`);
-        updateProgress({ phase: "resolving", percent: 0, detail: `Retry ${attempt}/${MAX_RESOLVE_RETRIES} — re-resolving link...` });
-        await sendProgress(true);
+        log(`Waiting ${wait / 1000}s before next source...`);
         await new Promise(r => setTimeout(r, wait));
       }
     }
