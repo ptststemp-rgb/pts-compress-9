@@ -47,7 +47,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm install axios
+          npm install axios form-data
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg libx265-dev
 
       - name: Verify FFmpeg
