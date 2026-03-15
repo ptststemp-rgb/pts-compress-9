@@ -2,7 +2,7 @@
 /**
  * compress-worker.js — GitHub Actions video compression worker
  *
- * Downloads video → FFmpeg encode to H.265 720p MP4 (faststart) →
+ * Downloads video → FFmpeg encode to H.265 480p MP4 (faststart) →
  * Uploads MP4 to VPS → Calls VPS callback.
  *
  * Supports source URL types:
@@ -351,7 +351,7 @@ async function downloadParallel(downloadUrl, totalBytes) {
 
 // ─── Step 2: FFmpeg encode to H.265 480p MP4 (faststart) ─
 async function encodeMP4() {
-  log("Encoding to H.265 720p MP4 (faststart)...");
+  log("Encoding to H.265 480p MP4 (faststart)...");
 
   updateProgress({ phase: "converting", percent: 0, speed: null, eta: null, detail: "Probing input..." });
   await sendProgress(true);
@@ -398,8 +398,8 @@ async function encodeMP4() {
     }
   }
 
-  // Choose output height: cap at 720p, keep original if already smaller
-  const targetHeight = Math.min(720, inputHeight || 720);
+  // Choose output height: cap at 480p, keep original if already smaller
+  const targetHeight = Math.min(480, inputHeight || 480);
 
   const args = [
     "-y", "-i", INPUT_FILE,
