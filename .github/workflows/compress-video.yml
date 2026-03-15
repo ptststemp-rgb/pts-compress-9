@@ -1,4 +1,4 @@
-name: Compress Video 480p
+name: Compress Video 720p
 
 on:
   workflow_dispatch:
@@ -49,6 +49,7 @@ jobs:
         run: |
           npm install axios
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg libx265-dev
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && sudo chmod a+rx /usr/local/bin/yt-dlp
 
       - name: Verify FFmpeg
         run: |
