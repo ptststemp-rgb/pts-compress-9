@@ -1,4 +1,4 @@
-name: HLS Compress Video 480p
+name: Compress Video 480p
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
         description: "Media ID in database"
         required: true
       file_name:
-        description: "Base name for HLS folder"
+        description: "Base name for output file"
         required: true
       source_url:
         description: "Direct download URL for source video"
@@ -47,7 +47,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm install axios form-data
+          npm install axios
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg libx265-dev
 
       - name: Verify FFmpeg
@@ -56,17 +56,15 @@ jobs:
           ffmpeg -version | head -1
           ffmpeg -encoders 2>/dev/null | grep libx265 || echo 'WARNING: libx265 not found'
 
-      - name: Run HLS compression + upload
+      - name: Run compression + upload
         env:
-          SPACEBYTE_API_TOKEN: ${{ secrets.SPACEBYTE_API_TOKEN }}
-          SPACEBYTE_PARENT_FOLDER_ID: ${{ secrets.SPACEBYTE_PARENT_FOLDER_ID }}
           VPS_COMPRESS_SECRET: ${{ secrets.VPS_COMPRESS_SECRET }}
+          UPLOAD_URL: ${{ secrets.UPLOAD_URL }}
           JOB_ID: ${{ inputs.job_id }}
           MEDIA_ID: ${{ inputs.media_id }}
           FILE_NAME: ${{ inputs.file_name }}
           SOURCE_URL: ${{ inputs.source_url }}
           CALLBACK_URL: ${{ inputs.callback_url }}
           PROGRESS_URL: ${{ inputs.progress_url }}
-          CATEGORY: ${{ inputs.category }}
           AUDIO_LANGUAGE: ${{ inputs.language }}
         run: node scripts/compress-worker.js
