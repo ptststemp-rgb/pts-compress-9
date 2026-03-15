@@ -585,6 +585,12 @@ async function main() {
 main().catch(err => {
   console.error(`\nFatal: ${err.message}`);
 
+  // Clean up temp files on failure
+  try { if (fs.existsSync(INPUT_FILE)) fs.unlinkSync(INPUT_FILE); } catch (_) {}
+  try { if (fs.existsSync(OUTPUT_FILE)) fs.unlinkSync(OUTPUT_FILE); } catch (_) {}
+  try { if (fs.existsSync(TEMP_DIR)) fs.rmSync(TEMP_DIR, { recursive: true, force: true }); } catch (_) {}
+  log("Cleaned up temp files after failure");
+
   const failProgress = async () => {
     if (PROGRESS_URL && SECRET) {
       await axios.post(PROGRESS_URL, {
