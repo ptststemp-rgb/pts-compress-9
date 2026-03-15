@@ -1,33 +1,29 @@
 #!/usr/bin/env node
 /**
- * compress-worker.js — GitHub Actions HLS video compression worker
+ * compress-worker.js — GitHub Actions video compression worker
  *
- * Downloads video → FFmpeg encode to H.265 480p HLS (fmp4 segments) →
- * Uploads all HLS files to SpaceByte → Calls VPS callback.
+ * Downloads video → FFmpeg encode to H.265 480p MP4 (faststart) →
+ * Uploads MP4 to VPS → Calls VPS callback.
  *
  * Sends real-time progress updates to VPS every second via PROGRESS_URL.
  *
  * Environment variables (set by GitHub Actions):
- *   SPACEBYTE_API_TOKEN        - SpaceByte API auth token
- *   SPACEBYTE_PARENT_FOLDER_ID - Parent folder (optional)
- *   VPS_COMPRESS_SECRET        - Shared secret for callback auth
- *   JOB_ID                     - Job queue ID
- *   MEDIA_ID                   - Media ID in database
- *   FILE_NAME                  - Base name for HLS folder
- *   SOURCE_URL                 - Direct download URL for source video
- *   CALLBACK_URL               - VPS callback endpoint (completion)
- *   PROGRESS_URL               - VPS progress endpoint (real-time)
+ *   VPS_COMPRESS_SECRET - Shared secret for VPS auth
+ *   JOB_ID             - Job queue ID
+ *   MEDIA_ID           - Media ID in database
+ *   FILE_NAME          - Base name for output file
+ *   SOURCE_URL         - Direct download URL for source video
+ *   CALLBACK_URL       - VPS callback endpoint (completion)
+ *   PROGRESS_URL       - VPS progress endpoint (real-time)
+ *   UPLOAD_URL         - VPS upload endpoint base URL
  */
 
 const fs = require("fs");
 const path = require("path");
 const { execSync, spawn } = require("child_process");
 const axios = require("axios");
-const FormData = require("form-data");
 
 // ─── Config ──────────────────────────────────────────
-const SB_TOKEN = process.env.SPACEBYTE_API_TOKEN;
-const SB_PARENT = process.env.SPACEBYTE_PARENT_FOLDER_ID || null;
 const SECRET = process.env.VPS_COMPRESS_SECRET;
 const JOB_ID = process.env.JOB_ID;
 const MEDIA_ID = process.env.MEDIA_ID;
@@ -35,15 +31,13 @@ const FILE_NAME = (process.env.FILE_NAME || "output").replace(/\.mp4$/i, "");
 const SOURCE_URL = process.env.SOURCE_URL;
 const CALLBACK_URL = process.env.CALLBACK_URL;
 const PROGRESS_URL = process.env.PROGRESS_URL;
-const CATEGORY = (process.env.CATEGORY || "movie").toLowerCase();
+const UPLOAD_URL = process.env.UPLOAD_URL; // e.g. http://163.245.223.113
 const AUDIO_LANGUAGE = (process.env.AUDIO_LANGUAGE || "").trim();
 
-const SB_API = "https://spacebyte.in/api/v1";
 const TEMP_DIR = "/tmp/compress";
 const INPUT_FILE = path.join(TEMP_DIR, "input.mp4");
-const HLS_DIR = path.join(TEMP_DIR, "hls");
+const OUTPUT_FILE = path.join(TEMP_DIR, "output.mp4");
 
-const PARALLEL_UPLOADS = 10;
 const PARALLEL_DOWNLOAD_CHUNKS = 4;
 const DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB per chunk
 const PROGRESS_INTERVAL = 1000; // 1 second
@@ -247,10 +241,9 @@ async function downloadParallel(totalBytes) {
   }
 }
 
-// ─── Step 2: FFmpeg encode to H.264 540p HLS ─────────
-async function encodeHLS() {
-  log("Encoding to H.265 480p HLS (fmp4 segments)...");
-  fs.mkdirSync(HLS_DIR, { recursive: true });
+// ─── Step 2: FFmpeg encode to H.265 480p MP4 (faststart) ─
+async function encodeMP4() {
+  log("Encoding to H.265 480p MP4 (faststart)...");
 
   updateProgress({ phase: "converting", percent: 0, speed: null, eta: null, detail: "Probing input..." });
   await sendProgress(true);
@@ -280,7 +273,6 @@ async function encodeHLS() {
   let audioMapArgs = [];
   if (AUDIO_LANGUAGE && audioStreams.length > 1) {
     const lang = AUDIO_LANGUAGE.toLowerCase();
-    // Map common language names to ISO 639 codes
     const langCodes = {
       english: ["eng", "en"], hindi: ["hin", "hi"], telugu: ["tel", "te"],
       tamil: ["tam", "ta"], kannada: ["kan", "kn"], malayalam: ["mal", "ml"],
@@ -289,7 +281,6 @@ async function encodeHLS() {
     const codes = langCodes[lang] || [lang];
     const allCodes = [lang, ...codes];
 
-    // Match by language tag or title
     let match = audioStreams.find(a => allCodes.includes(a.lang) || allCodes.some(c => a.title.includes(c)));
     if (match) {
       audioMapArgs = ["-map", "0:v:0", "-map", `0:${match.index}`];
@@ -302,7 +293,6 @@ async function encodeHLS() {
   // Choose output height: cap at 480p, keep original if already smaller
   const targetHeight = Math.min(480, inputHeight || 480);
 
-  const manifestPath = path.join(HLS_DIR, "index.m3u8");
   const args = [
     "-y", "-i", INPUT_FILE,
     ...audioMapArgs,
@@ -312,20 +302,11 @@ async function encodeHLS() {
     "-vf", `scale=-2:'min(${targetHeight},ih)'`,
     "-pix_fmt", "yuv420p",
     "-tag:v", "hvc1",
-    "-g", "48",
-    "-keyint_min", "48",
-    "-sc_threshold", "0",
     "-c:a", "aac", "-b:a", "96k", "-ac", "2",
-    "-f", "hls",
-    "-hls_time", "4",
-    "-hls_playlist_type", "vod",
-    "-hls_flags", "independent_segments",
-    "-hls_segment_type", "fmp4",
-    "-hls_fmp4_init_filename", "init.mp4",
-    "-hls_segment_filename", path.join(HLS_DIR, "seg_%05d.m4s"),
+    "-movflags", "+faststart",
     "-sn", "-dn",
     "-progress", "pipe:1",
-    manifestPath
+    OUTPUT_FILE
   ];
 
   return new Promise((resolve, reject) => {
@@ -333,7 +314,6 @@ async function encodeHLS() {
     let stderr = "";
     let currentTimeSec = 0;
 
-    // Parse -progress pipe:1 output (key=value lines)
     child.stdout.on("data", (chunk) => {
       const lines = chunk.toString().split("\n");
       for (const line of lines) {
@@ -372,12 +352,11 @@ async function encodeHLS() {
     child.on("close", (code) => {
       if (code === 0) {
         try { fs.unlinkSync(INPUT_FILE); } catch (_) {}
-        const files = fs.readdirSync(HLS_DIR);
-        const totalSize = files.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
-        log(`HLS output: ${files.length} files, ${(totalSize / 1024 / 1024).toFixed(1)} MB total`);
-        updateProgress({ phase: "converting", percent: 100, eta: 0, detail: `${files.length} segments created` });
+        const outputSize = fs.statSync(OUTPUT_FILE).size;
+        log(`MP4 output: ${(outputSize / 1024 / 1024).toFixed(1)} MB`);
+        updateProgress({ phase: "converting", percent: 100, eta: 0, detail: `${(outputSize / 1024 / 1024).toFixed(1)} MB encoded` });
         sendProgress(true);
-        resolve({ files, totalSize, duration });
+        resolve({ outputSize, duration });
       } else {
         reject(new Error(`FFmpeg failed (code ${code}): ${stderr.slice(-300)}`));
       }
@@ -386,130 +365,60 @@ async function encodeHLS() {
   });
 }
 
-// ─── SpaceByte folder helpers ────────────────────────
-const sbHeaders = () => ({
-  Authorization: `Bearer ${SB_TOKEN}`,
-  "Content-Type": "application/json"
-});
-
-async function getOrCreateCategoryFolder() {
-  // Category folder name: "Movies" or "Series"
-  const categoryName = CATEGORY === "series" ? "Series" : "Movies";
-  const parentId = SB_PARENT || null;
-
-  // Search for existing folder (at root or under parent)
-  try {
-    const params = { per_page: 100 };
-    if (parentId) params.parentIds = parentId;
-    const resp = await withRetry(() => axios.get(`${SB_API}/drive/file-entries`, {
-      headers: sbHeaders(), params, timeout: 30000
-    }), "list folders");
-    const entries = resp.data?.data || [];
-    const existing = entries.find(f =>
-      f.type === "folder" && (f.name || "").toLowerCase() === categoryName.toLowerCase()
-    );
-    if (existing) {
-      log(`Found existing "${categoryName}" folder: ${existing.id}`);
-      return String(existing.id);
-    }
-  } catch (err) {
-    log(`Could not list existing folders: ${err.message} — will try creating`);
-  }
-
-  // Create the category folder
-  const body = { name: categoryName };
-  if (parentId) body.parentId = String(parentId);
-  log(`Creating "${categoryName}" folder${parentId ? ` under parent ${parentId}` : " at root"}`);
-
-  const resp = await withRetry(() => axios.post(`${SB_API}/folders`, body, {
-    headers: sbHeaders(), timeout: 30000
-  }), "create category folder");
-
-  const id = resp.data?.folder?.id || resp.data?.id || resp.data?.data?.id;
-  if (!id) throw new Error(`Failed to create ${categoryName} folder: ${JSON.stringify(resp.data).slice(0, 300)}`);
-  return String(id);
-}
-
-// ─── Step 3: Upload to SpaceByte via direct S3 presigned URLs ──
-async function uploadToSpaceByte(hlsFiles) {
-  if (!SB_TOKEN) throw new Error("SPACEBYTE_API_TOKEN is required");
-  log(`Uploading ${hlsFiles.length} HLS files to SpaceByte (direct S3)...`);
-  updateProgress({ phase: "uploading", percent: 0, speed: null, eta: null, detail: "Uploading to SpaceByte..." });
+// ─── Step 3: Upload MP4 to VPS ───────────────────────
+async function uploadToVPS() {
+  const fileSize = fs.statSync(OUTPUT_FILE).size;
+  log(`Uploading ${(fileSize / 1024 / 1024).toFixed(1)} MB to VPS...`);
+  updateProgress({ phase: "uploading", percent: 0, speed: null, eta: null, detail: "Uploading to VPS..." });
   await sendProgress(true);
 
-  const categoryFolderId = await getOrCreateCategoryFolder();
-  const folderName = `hls_${FILE_NAME}_${Date.now()}`.slice(0, 200);
+  const uploadUrl = `${UPLOAD_URL}/api/media/${encodeURIComponent(MEDIA_ID)}/upload`;
+  const uploadStart = Date.now();
 
-  const folderResp = await withRetry(() => axios.post(`${SB_API}/folders`, {
-    name: folderName, parentId: categoryFolderId
-  }, { headers: sbHeaders(), timeout: 30000 }), "create HLS folder");
+  // Stream the file to VPS with progress tracking
+  const fileStream = fs.createReadStream(OUTPUT_FILE);
+  let uploadedBytes = 0;
 
-  const folderId = folderResp.data?.folder?.id || folderResp.data?.id || folderResp.data?.data?.id;
-  if (!folderId) throw new Error(`SpaceByte folder creation failed`);
-  log(`SpaceByte folder: ${folderId}`);
+  fileStream.on("data", (chunk) => {
+    uploadedBytes += chunk.length;
+    const now = Date.now();
+    const elapsedSec = (now - uploadStart) / 1000;
+    const speed = elapsedSec > 0 ? uploadedBytes / elapsedSec : 0;
+    const remaining = speed > 0 ? (fileSize - uploadedBytes) / speed : null;
+    const pct = (uploadedBytes / fileSize) * 100;
 
-  const fileMap = {};
-  let uploaded = 0;
-  let totalUploadedBytes = 0;
-  const totalUploadSize = hlsFiles.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
-  const uploadStartTime = Date.now();
-
-  async function uploadOne(fileName) {
-    const filePath = path.join(HLS_DIR, fileName);
-    const fileData = fs.readFileSync(filePath);
-    const isManifest = fileName.endsWith(".m3u8");
-    const contentType = isManifest ? "application/vnd.apple.mpegurl"
-      : fileName.endsWith(".mp4") ? "video/mp4" : "video/iso.segment";
-
-    // Upload via multipart POST /uploads (reliable — avoids broken S3 presign flow)
-    const form = new FormData();
-    form.append("file", fileData, { filename: fileName, contentType });
-    form.append("parentId", String(folderId));
-
-    const entry = await withRetry(() => axios.post(`${SB_API}/uploads`, form, {
-      headers: { ...form.getHeaders(), Authorization: `Bearer ${SB_TOKEN}` },
-      maxContentLength: Infinity, maxBodyLength: Infinity, timeout: 180000
-    }), `upload ${fileName}`, 3);
-
-    const id = entry.data?.fileEntry?.id;
-    if (id) fileMap[fileName] = String(id);
-    uploaded++;
-    totalUploadedBytes += fileData.length;
-    const pct = (uploaded / hlsFiles.length) * 100;
-    const elapsedSec = (Date.now() - uploadStartTime) / 1000;
-    const speed = elapsedSec > 0 ? totalUploadedBytes / elapsedSec : 0;
-    const remaining = speed > 0 ? (totalUploadSize - totalUploadedBytes) / speed : null;
     updateProgress({
       phase: "uploading",
       percent: Math.round(pct * 10) / 10,
       speed: Math.round(speed),
       eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
-      detail: `${uploaded}/${hlsFiles.length} files (${(totalUploadedBytes / 1024 / 1024).toFixed(1)} / ${(totalUploadSize / 1024 / 1024).toFixed(1)} MB)`
+      detail: `${(uploadedBytes / 1024 / 1024).toFixed(1)} / ${(fileSize / 1024 / 1024).toFixed(1)} MB`
     });
-  }
+  });
 
-  const queue = [...hlsFiles];
-  const active = new Set();
-  while (queue.length > 0 || active.size > 0) {
-    while (active.size < PARALLEL_UPLOADS && queue.length > 0) {
-      const fileName = queue.shift();
-      const p = uploadOne(fileName).catch(err => {
-        log(`  Upload failed: ${fileName} (${err.message.slice(0, 100)})`);
-        throw err; // withRetry inside uploadOne already handles retries
-      });
-      active.add(p);
-      p.finally(() => active.delete(p));
-    }
-    if (active.size > 0) await Promise.race([...active]);
-  }
+  const resp = await withRetry(() => axios.put(uploadUrl, fs.createReadStream(OUTPUT_FILE), {
+    headers: {
+      "X-Compress-Secret": SECRET,
+      "Content-Type": "application/octet-stream",
+      "Content-Length": fileSize
+    },
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity,
+    timeout: 600000 // 10 min for large files
+  }), "VPS upload", 3);
 
-  const totalSize = hlsFiles.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
-  log(`SpaceByte backup: ${Object.keys(fileMap).length}/${hlsFiles.length} files, folder ${folderId}`);
-  return { folderId: String(folderId), manifestFileId: fileMap["index.m3u8"] || null, fileMap, totalSize, segmentCount: hlsFiles.length };
+  if (!resp.data?.ok) throw new Error(`VPS upload failed: ${JSON.stringify(resp.data).slice(0, 300)}`);
+
+  const elapsed = ((Date.now() - uploadStart) / 1000).toFixed(1);
+  log(`Uploaded to VPS in ${elapsed}s (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
+  updateProgress({ phase: "uploading", percent: 100, detail: `Uploaded in ${elapsed}s` });
+  await sendProgress(true);
+
+  return fileSize;
 }
 
 // ─── Step 4: Callback to VPS ─────────────────────────
-async function callback(sbData, originalSize) {
+async function callback(videoSize, originalSize) {
   log(`Calling back to VPS: ${CALLBACK_URL}`);
   updateProgress({ phase: "done", percent: 100, detail: "Sending results..." });
   await sendProgress(true);
@@ -517,13 +426,7 @@ async function callback(sbData, originalSize) {
   const resp = await withRetry(() => axios.post(CALLBACK_URL, {
     mediaId: MEDIA_ID,
     jobId: JOB_ID,
-    hls: {
-      segmentCount: sbData.segmentCount,
-      totalSize: sbData.totalSize,
-      folderId: sbData.folderId,
-      manifestFileId: sbData.manifestFileId,
-      fileMap: sbData.fileMap
-    },
+    video: { size: videoSize },
     originalSize,
     secret: SECRET
   }, {
@@ -537,37 +440,30 @@ async function callback(sbData, originalSize) {
 
 // ─── Main ────────────────────────────────────────────
 async function main() {
-  if (!MEDIA_ID || !CALLBACK_URL || !SOURCE_URL) {
-    console.error("Missing required env vars (MEDIA_ID, CALLBACK_URL, SOURCE_URL)");
-    process.exit(1);
-  }
-  if (!SB_TOKEN) {
-    console.error("Missing SPACEBYTE_API_TOKEN");
+  if (!MEDIA_ID || !CALLBACK_URL || !SOURCE_URL || !UPLOAD_URL) {
+    console.error("Missing required env vars (MEDIA_ID, CALLBACK_URL, SOURCE_URL, UPLOAD_URL)");
     process.exit(1);
   }
 
   fs.mkdirSync(TEMP_DIR, { recursive: true });
-  log(`=== HLS Compress: ${MEDIA_ID} (job ${JOB_ID}) ===`);
+  log(`=== Compress: ${MEDIA_ID} (job ${JOB_ID}) ===`);
 
   const originalSize = await download();
-  const { files, totalSize } = await encodeHLS();
+  const { outputSize } = await encodeMP4();
 
-  const reduction = originalSize > 0 ? ((1 - totalSize / originalSize) * 100).toFixed(1) : 0;
-  log(`Size reduction: ${reduction}% (${(originalSize / 1024 / 1024).toFixed(1)} MB → ${(totalSize / 1024 / 1024).toFixed(1)} MB)`);
+  const reduction = originalSize > 0 ? ((1 - outputSize / originalSize) * 100).toFixed(1) : 0;
+  log(`Size reduction: ${reduction}% (${(originalSize / 1024 / 1024).toFixed(1)} MB → ${(outputSize / 1024 / 1024).toFixed(1)} MB)`);
 
-  // Upload to SpaceByte via direct S3 presigned URLs
-  const sbData = await uploadToSpaceByte(files);
+  const videoSize = await uploadToVPS();
+  await callback(videoSize, originalSize);
 
-  await callback(sbData, originalSize);
-
-  try { fs.rmSync(HLS_DIR, { recursive: true, force: true }); } catch (_) {}
+  try { fs.unlinkSync(OUTPUT_FILE); } catch (_) {}
   log("=== Done! ===");
 }
 
 main().catch(err => {
   console.error(`\nFatal: ${err.message}`);
 
-  // Report failure
   const failProgress = async () => {
     if (PROGRESS_URL && SECRET) {
       await axios.post(PROGRESS_URL, {
