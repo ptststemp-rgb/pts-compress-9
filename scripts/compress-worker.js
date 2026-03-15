@@ -23,6 +23,7 @@ const fs = require("fs");
 const path = require("path");
 const { execSync, spawn } = require("child_process");
 const axios = require("axios");
+const FormData = require("form-data");
 
 // ─── Config ──────────────────────────────────────────
 const SB_TOKEN = process.env.SPACEBYTE_API_TOKEN;
@@ -459,26 +460,16 @@ async function uploadToSpaceByte(hlsFiles) {
     const isManifest = fileName.endsWith(".m3u8");
     const contentType = isManifest ? "application/vnd.apple.mpegurl"
       : fileName.endsWith(".mp4") ? "video/mp4" : "video/iso.segment";
-    const ext = fileName.split(".").pop();
 
-    // Get presigned S3 URL
-    const presign = await withRetry(() => axios.post(`${SB_API}/s3/simple/presign`, {
-      filename: fileName, mime: contentType, size: fileData.length, extension: ext
-    }, { headers: sbHeaders(), timeout: 30000 }), `presign ${fileName}`);
+    // Upload via multipart POST /uploads (reliable — avoids broken S3 presign flow)
+    const form = new FormData();
+    form.append("file", fileData, { filename: fileName, contentType });
+    form.append("parentId", String(folderId));
 
-    const { url, key, acl } = presign.data;
-
-    // Upload directly to S3
-    await withRetry(() => axios.put(url, fileData, {
-      headers: { "Content-Type": contentType, "x-amz-acl": acl },
+    const entry = await withRetry(() => axios.post(`${SB_API}/uploads`, form, {
+      headers: { ...form.getHeaders(), Authorization: `Bearer ${SB_TOKEN}` },
       maxContentLength: Infinity, maxBodyLength: Infinity, timeout: 180000
-    }), `s3put ${fileName}`, 3);
-
-    // Register file entry in SpaceByte
-    const entry = await withRetry(() => axios.post(`${SB_API}/s3/entries`, {
-      filename: key, parentId: String(folderId), size: fileData.length,
-      mime: contentType, clientMime: contentType, clientName: fileName, clientExtension: ext
-    }, { headers: sbHeaders(), timeout: 30000 }), `register ${fileName}`);
+    }), `upload ${fileName}`, 3);
 
     const id = entry.data?.fileEntry?.id;
     if (id) fileMap[fileName] = String(id);
