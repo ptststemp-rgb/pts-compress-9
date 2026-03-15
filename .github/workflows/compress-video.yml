@@ -1,4 +1,4 @@
-name: Compress Video 720p
+name: Compress Video 480p
 
 on:
   workflow_dispatch:
