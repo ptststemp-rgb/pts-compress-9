@@ -165,25 +165,48 @@ async function resolveNexdriveLinks(url) {
   const sources = [];
 
   // Extract all known source links in priority order
+  // Only include sources that can be resolved server-side (no captcha)
   const vcloudMatch = html.match(/https?:\/\/(www\.)?vcloud\.zip\/[^"'<>\s]+/i);
   if (vcloudMatch) sources.push({ type: "vcloud", url: vcloudMatch[0] });
 
+  const filebeeMatch = html.match(/https?:\/\/(www\.)?filebee\.xyz\/[^"'<>\s]+/i);
+  if (filebeeMatch) sources.push({ type: "filebee", url: filebeeMatch[0] });
+
   const fastdlMatch = html.match(/https?:\/\/(www\.)?fastdl\.zip\/[^"'<>\s]+/i);
   if (fastdlMatch) sources.push({ type: "fastdl", url: fastdlMatch[0] });
-
-  const filebeeMatch = html.match(/https?:\/\/(www\.)?filebee\.xyz\/[^"'<>\s]+/i);
-  if (filebeeMatch) sources.push({ type: "direct", url: filebeeMatch[0] });
-
-  const dropgalaxyMatch = html.match(/https?:\/\/(www\.)?dropgalaxy\.vip\/[^"'<>\s]+/i);
-  if (dropgalaxyMatch) sources.push({ type: "direct", url: dropgalaxyMatch[0] });
-
-  const gdtotMatch = html.match(/https?:\/\/(www\.|new\d+\.)?gdtot\.[^"'<>\s]+/i);
-  if (gdtotMatch) sources.push({ type: "direct", url: gdtotMatch[0] });
 
   if (sources.length === 0) throw new Error("nexdrive.pro: No download source links found on page");
 
   log(`nexdrive.pro: Found ${sources.length} sources: ${sources.map(s => s.type + "=" + s.url.split("/")[2]).join(", ")}`);
   return sources;
+}
+
+// ─── filebee.xyz Resolver (extract hidden CDN link) ─
+async function resolveFilebeeUrl(url) {
+  log("Resolving filebee.xyz link...");
+  updateProgress({ phase: "resolving", percent: 50, detail: "Resolving filebee.xyz link..." });
+
+  const page = await withRetry(() => axios.get(url, {
+    timeout: 30000,
+    maxRedirects: 10,
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+  }), "filebee page");
+
+  const html = page.data;
+
+  // filebee/filepress pages have a hidden <a> with CDN link (cdn-cgi/content or r2.dev)
+  const match = html.match(/href\s*=\s*"(https?:\/\/[^"]*cdn-cgi\/content[^"]+)"/i)
+    || html.match(/href\s*=\s*'(https?:\/\/[^']*cdn-cgi\/content[^']+)'/i)
+    || html.match(/href\s*=\s*"(https?:\/\/[^"]*\.r2\.dev[^"]+)"/i)
+    || html.match(/href\s*=\s*"(https?:\/\/[^"]*pixeldrain[^"]+)"/i);
+
+  if (!match) throw new Error("filebee.xyz: Could not extract CDN download link");
+
+  const directUrl = match[1];
+  log(`filebee.xyz resolved → ${directUrl.slice(0, 100)}...`);
+  updateProgress({ phase: "resolving", percent: 100, detail: "Link resolved" });
+  await sendProgress(true);
+  return directUrl;
 }
 
 // ─── fastdl.zip Resolver ────────────────────────────
@@ -197,12 +220,15 @@ async function resolveFastdlUrl(url) {
     headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
   }), "fastdl page");
 
-  // fastdl.zip pages typically have a direct download link in a var or anchor
+  // Check for dead/deleted file
+  if (page.data.includes("File is Deleted") || page.data.includes("UnAvailable")) {
+    throw new Error("fastdl.zip: File is deleted or unavailable");
+  }
+
   const match = page.data.match(/var\s+url\s*=\s*'([^']+)'/)
     || page.data.match(/var\s+url\s*=\s*"([^"]+)"/)
     || page.data.match(/href\s*=\s*"(https?:\/\/[^"]+\.mp4[^"]*)"/i)
-    || page.data.match(/href\s*=\s*'(https?:\/\/[^']+\.mp4[^']*)'/i)
-    || page.data.match(/source\s+src\s*=\s*"(https?:\/\/[^"]+)"/i);
+    || page.data.match(/href\s*=\s*'(https?:\/\/[^']+\.mp4[^']*)'/i);
 
   if (!match) throw new Error("fastdl.zip: Could not extract direct URL");
 
@@ -643,10 +669,12 @@ async function main() {
         let directUrl;
         if (source.type === "vcloud") {
           directUrl = await resolveVcloudUrl(source.url);
+        } else if (source.type === "filebee") {
+          directUrl = await resolveFilebeeUrl(source.url);
         } else if (source.type === "fastdl") {
           directUrl = await resolveFastdlUrl(source.url);
         } else {
-          directUrl = source.url; // direct link (filebee, dropgalaxy, gdtot)
+          directUrl = source.url;
         }
         try { if (fs.existsSync(INPUT_FILE)) fs.unlinkSync(INPUT_FILE); } catch (_) {}
         originalSize = await download(directUrl);
