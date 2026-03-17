@@ -461,11 +461,14 @@ async function downloadSingle(downloadUrl, totalBytes) {
       const speed = (downloadedBytes - lastSpeedBytes) / elapsed;
       const remaining = totalBytes > 0 ? (totalBytes - downloadedBytes) / speed : null;
       const pct = totalBytes > 0 ? Math.min(99, (downloadedBytes / totalBytes) * 100) : 0;
+      const dlMB = (downloadedBytes / 1024 / 1024).toFixed(1);
+      const totalMB = totalBytes > 0 ? (totalBytes / 1024 / 1024).toFixed(1) + " MB" : "?";
+      const speedMB = (speed / 1024 / 1024).toFixed(1);
       updateProgress({
         phase: "downloading", percent: Math.round(pct * 10) / 10,
         speed: Math.round(speed),
         eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
-        detail: `${(downloadedBytes / 1024 / 1024).toFixed(1)} / ${totalBytes > 0 ? (totalBytes / 1024 / 1024).toFixed(1) + " MB" : "?"}`
+        detail: `${dlMB} / ${totalMB} @ ${speedMB} MB/s`
       });
       lastSpeedCheck = now; lastSpeedBytes = downloadedBytes;
     }
